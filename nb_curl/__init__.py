@@ -50,7 +50,7 @@ from .session import (
 from .xcctls import load_fp_snapshot, parse_xcctls
 from . import tls as tls
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 
 def backend_name() -> str:

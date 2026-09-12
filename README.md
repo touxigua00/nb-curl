@@ -15,8 +15,6 @@ print(r.status_code, r.http_version)   # 200 2
 
 ## 安装
 
-有预编译好的 wheel，不需要编译器：
-
 ```bash
 pip install nb-curl
 
@@ -24,9 +22,7 @@ pip install nb-curl
 pip install nb_curl-0.2.1-py3-none-win_amd64.whl
 ```
 
-一个 wheel 覆盖整个 Python 3.x；想连第三方依赖都不要，可以 `pip install --no-deps nb-curl`。
-
-支持平台：Windows x64、Linux x86_64（均已实机验证）。
+支持平台：Windows x64、Linux x86_64。
 
 ---
 
@@ -45,10 +41,7 @@ HTTP/2 指纹与请求头等维度扣分。内置预设实测：
 | `chrome152` | **95 / 100** |
 | `chrome150` | **95 / 100** |
 
-唯一扣分项是 ECH 未启用（-5）——这需要服务端在 DNS 里公布 ECH 配置才能发出去，与指纹实现无关。
-
-**并发性能**：在 6 个主流 Python HTTP 客户端的同条件横向评测中（Windows + Python 3.13，靶机 48 核 Linux，
-TLS + HTTP/2 + 浏览器指纹），nb-curl 的**综合加权得分最高**：
+**并发性能**：
 
 | 指标 | 实测值 |
 | --- | --- |
@@ -215,7 +208,7 @@ nb_curl.get(url, impersonate="chrome150", diy_fp={
 
 #### `fp_file` —— 一键复刻真实浏览器（最省事）
 
-**这是最推荐的方式：不用懂上面任何参数。**
+**这是最简单的方式：不用懂上面任何参数。**
 
 用真浏览器打开 [https://www.xcctls.top/all](https://www.xcctls.top/all)，把返回的 JSON 存成一个文件，
 然后直接喂给 `fp_file` —— 那个浏览器的**完整指纹（含默认请求头）就被逐字段复刻**了：
@@ -240,7 +233,7 @@ nb_curl.get(url, impersonate=fp)
 nb_curl.get(url, fp_file="real_chrome.json", impersonate="chrome152")
 ```
 
-想换浏览器？在浏览器里重新打开一次 `/all`、存成新 JSON 就行，**不用改代码、不用重编译**。
+想换浏览器？在浏览器里重新打开一次 `/all`、存成新 JSON 就行。
 
 ### 取值范围自省 —— 不用猜，传错立刻报错
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nb-curl"
-version = "0.2.1"
+version = "0.2.2"
 description = "自带浏览器 TLS/HTTP2 指纹的 HTTP 客户端（libcurl-impersonate + BoringSSL）"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -22,6 +22,12 @@ dependencies = [
     "cffi>=1.15; implementation_name == 'cpython'",
     # CA 证书已内置在 nb_curl/_lib/cacert.pem，certifi 不是必需的。
 ]
+
+[project.urls]
+Homepage = "https://github.com/touxigua00/nb-curl"
+Repository = "https://github.com/touxigua00/nb-curl"
+Issues = "https://github.com/touxigua00/nb-curl/issues"
+Changelog = "https://github.com/touxigua00/nb-curl/releases"
 
 [project.optional-dependencies]
 # 想让 CA 根证书跟随 certifi 自动更新（否则用包内快照）
