@@ -1,0 +1,37 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 构建脚手架（仅本地使用）----
+native/
+_cffi_build.py
+
+# ---- 本地产物 ----
+build/
+dist/
+*.obj
+*.exp
+*.pdb
+*.ilk
+*.tlog
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- 本地配置 ----
+.env
+.env.*

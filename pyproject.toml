@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nb-curl"
+version = "0.2.1"
+description = "自带浏览器 TLS/HTTP2 指纹的 HTTP 客户端（libcurl-impersonate + BoringSSL）"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["curl", "impersonate", "ja3", "ja4", "akamai", "tls-fingerprint", "http2"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+    # CFFI API 模式扩展运行期依赖 _cffi_backend，所以 cffi 是默认依赖。
+    # 如果你只想要 ctypes 后端（零第三方依赖），可以 pip install --no-deps。
+    "cffi>=1.15; implementation_name == 'cpython'",
+    # CA 证书已内置在 nb_curl/_lib/cacert.pem，certifi 不是必需的。
+]
+
+[project.optional-dependencies]
+# 想让 CA 根证书跟随 certifi 自动更新（否则用包内快照）
+certifi = ["certifi>=2023.7.22"]
+# 需要构建 wheel / 重编 CFFI 扩展时
+build = ["setuptools>=64", "wheel", "cffi>=1.15"]
+test = []
+
+[tool.setuptools]
+packages = ["nb_curl"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+nb_curl = [
+    # 各平台动态库
+    "_lib/nb_curl_native.dll",
+    "_lib/libnb_curl_native.so",
+    "_lib/libnb_curl_native.dylib",
+    # 内置 CA 快照
+    "_lib/cacert.pem",
+    # CFFI API 模式扩展
+    "*.pyd",
+    "*.so",
+    "*.dylib",
+]

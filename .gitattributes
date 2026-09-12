@@ -1,0 +1,22 @@
+# 统一换行符，避免 Windows 上编辑脚本后拿到 Linux 跑出
+# "set: pipefail: invalid option name" 这种诡异错误。
+
+* text=auto eol=lf
+
+*.py      text eol=lf
+*.md      text eol=lf
+*.toml    text eol=lf
+*.in      text eol=lf
+*.sh      text eol=lf
+Dockerfile text eol=lf
+
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+
+# 二进制产物不做任何转换
+*.dll     binary
+*.so      binary
+*.pyd     binary
+*.dylib   binary
+*.whl     binary
+*.pem     text eol=lf

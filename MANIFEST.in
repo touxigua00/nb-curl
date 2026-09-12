@@ -1,0 +1,21 @@
+# sdist 内容清单
+include README.md
+include pyproject.toml
+include setup.py
+
+# 二进制产物：动态库 + CFFI 扩展 + 内置 CA 快照
+recursive-include nb_curl/_lib *.dll *.so *.dylib *.pem
+include nb_curl/_nb_curl_cffi*.pyd
+include nb_curl/_nb_curl_cffi*.so
+include nb_curl/_nb_curl_cffi*.dylib
+
+# 测试（纯 Python，可选，不影响使用）
+recursive-include tests *.py
+
+# --- 以下一律不发 ---
+prune native
+global-exclude *.pyc *.pyo
+global-exclude __pycache__/*
+global-exclude *.c *.h *.cpp *.cc *.hpp
+global-exclude *.obj *.exp *.lib *.a *.o
+global-exclude *.pdb *.ilk
