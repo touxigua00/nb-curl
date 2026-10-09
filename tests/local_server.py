@@ -114,6 +114,33 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, data, "application/octet-stream")
             return
 
+        if path.startswith("/drip/"):
+            # /drip/<块数>/<每块字节>[?interval=0.3]
+            # 分多次、带间隔地发同一份响应体：客户端若真是"边收边给"，
+            # 第一块必然在第一段间隔之前就能拿到；整体缓冲的实现则要等全部发完。
+            rest = path[len("/drip/"):]
+            chunks_s, _, size_s = rest.partition("/")
+            n_chunks = max(1, int(chunks_s or 5))
+            size = max(1, int(size_s or 200))
+            interval = 0.3
+            if "?" in self.path:
+                for pair in self.path.split("?", 1)[1].split("&"):
+                    k, _, v = pair.partition("=")
+                    if k == "interval" and v:
+                        interval = float(v)
+            payload = b"z" * size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size * n_chunks))
+            self.end_headers()
+            if self.command != "HEAD":
+                for _ in range(n_chunks):
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                    if interval:
+                        time.sleep(interval)
+            return
+
         if path == "/gzip":
             import gzip
 

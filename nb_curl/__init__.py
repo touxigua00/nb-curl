@@ -11,10 +11,16 @@
 ``fp_file``（xcctls.top/all 快照）在 Python 侧下发，无需重编译。
 自定义参数的合法取值范围用 ``nb_curl.tls`` 自省（如 ``nb_curl.tls.supported_ciphers()``），
 给错值会在请求发出前抛 ``nb_curl.FingerprintError``，不会到建连时才报难懂的 CURLcode。
+
+**所有参数（能传什么、怎么给）见 :mod:`nb_curl.params`**：
+``help(nb_curl.params.RequestOptions)`` 或 ``print(nb_curl.params.describe())``。
 """
 
 from __future__ import annotations
 
+# AsyncSession 直接导入：模块级 __getattr__ 会让 IDE 认为本模块属性是动态的，
+# 从而失去补全与 Ctrl+B 跳转（asyncio 是标准库，导入开销可忽略）
+from .aio import AsyncSession
 from ._native import (
     BACKEND as _BACKEND,
     available_backends,
@@ -29,13 +35,16 @@ from .exceptions import (
     ImpersonateError,
     ProxyError,
     RequestError,
+    TCPShapeError,
+    TCPShapeWarning,
     Timeout,
     TooManyRedirects,
     UnsupportedError,
 )
 from .fingerprint import Fingerprint, FingerprintOverrides, diy_fp_fields
 from .impersonate import RECOMMENDED_TARGETS, available_targets, is_available
-from .models import Cookies, Headers, Request, Response
+from .models import CookieJar, Cookies, Headers, Request, Response
+from .options import CurlOpt, apply_curl_options
 from .session import (
     Session,
     delete,
@@ -47,10 +56,14 @@ from .session import (
     put,
     request,
 )
+from .ws import WebSocket
 from .xcctls import load_fp_snapshot, parse_xcctls
+from . import params as params
+from . import tcp as tcp
 from . import tls as tls
+from .tcp import set_tcp_warnings, tcp_support
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 
 
 def backend_name() -> str:
@@ -70,8 +83,14 @@ __all__ = [
     "Request",
     "Headers",
     "Cookies",
+    "CookieJar",
     "Fingerprint",
     "FingerprintOverrides",
+    "WebSocket",
+    "CurlOpt",
+    "apply_curl_options",
+    # 异步
+    "AsyncSession",
     # 便捷函数
     "request",
     "get",
@@ -87,6 +106,12 @@ __all__ = [
     "RECOMMENDED_TARGETS",
     # TLS 取值范围自省（自定义指纹允许哪些值，看这里）
     "tls",
+    # 参数总表：能传什么、怎么给（help(nb_curl.params.RequestOptions)）
+    "params",
+    # TCP 层画像（JA4T）：socket 级设定 + 能力自省
+    "tcp",
+    "tcp_support",
+    "set_tcp_warnings",
     # diy_fp 字段类型/取值自省
     "diy_fp_fields",
     # xcctls.top/all 快照：解析与加载
@@ -103,13 +128,6 @@ __all__ = [
     "ProxyError",
     "TooManyRedirects",
     "UnsupportedError",
+    "TCPShapeError",
+    "TCPShapeWarning",
 ]
-
-
-def __getattr__(name: str):
-    """延迟导入 AsyncSession，避免没装 asyncio 场景下的额外开销。"""
-    if name == "AsyncSession":
-        from .aio import AsyncSession
-
-        return AsyncSession
-    raise AttributeError("module %r has no attribute %r" % (__name__, name))

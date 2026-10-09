@@ -29,6 +29,8 @@ from .exceptions import (
     ImpersonateError,
     ProxyError,
     RequestError,
+    TCPShapeError,
+    TCPShapeWarning,
     Timeout,
     TooManyRedirects,
     UnsupportedError,
@@ -54,5 +56,5 @@ __all__ = [
     # 异常
     "NbCurlError", "RequestError", "ImpersonateError", "FingerprintError",
     "HTTPError", "Timeout", "ConnectTimeout", "ProxyError",
-    "TooManyRedirects", "UnsupportedError",
+    "TooManyRedirects", "UnsupportedError", "TCPShapeError", "TCPShapeWarning",
 ]

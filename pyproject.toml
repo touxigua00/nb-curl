@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nb-curl"
-version = "0.2.2"
+version = "0.3.0"
 description = "自带浏览器 TLS/HTTP2 指纹的 HTTP 客户端（libcurl-impersonate + BoringSSL）"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -21,6 +21,9 @@ dependencies = [
     # 如果你只想要 ctypes 后端（零第三方依赖），可以 pip install --no-deps。
     "cffi>=1.15; implementation_name == 'cpython'",
     # CA 证书已内置在 nb_curl/_lib/cacert.pem，certifi 不是必需的。
+    # 参数用 PEP 692 的 Unpack[TypedDict] 声明（见 nb_curl/params.py）：
+    # 3.11+ 用 typing.Unpack，3.9/3.10 才需要 typing_extensions（仅类型检查器用）。
+    "typing_extensions>=4.4; python_version < '3.11'",
 ]
 
 [project.urls]
@@ -52,4 +55,6 @@ nb_curl = [
     "*.pyd",
     "*.so",
     "*.dylib",
+    # PEP 561 类型标记：让 IDE 按带类型注解的包对待（补全/参数提示/跳转）
+    "py.typed",
 ]

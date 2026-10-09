@@ -13,7 +13,6 @@ include nb_curl/_nb_curl_cffi*.dylib
 recursive-include tests *.py
 
 # --- 以下一律不发 ---
-prune native
 global-exclude *.pyc *.pyo
 global-exclude __pycache__/*
 global-exclude *.c *.h *.cpp *.cc *.hpp

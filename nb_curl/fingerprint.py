@@ -86,6 +86,7 @@ _DIY_FP_KEYS = {
     "http2_stream_weight",
     "http2_stream_exclusive",
     "http2_no_priority",
+    "http2_headers_priority",
     "header_order",
     "split_cookies",
     "enable_alps",
@@ -119,8 +120,9 @@ DIY_FP_SPEC: dict[str, tuple[str, str]] = {
         "委托凭据签名算法列表（合法名同 tls_signature_algorithms）"),
     "tls_trust_anchors": (
         "str（逗号分隔）",
-        "trust_anchors(51764) 扩展要携带的信任锚名列表；"
-        "空串 '' 表示发送空列表（真实 Chrome 152 的行为）"),
+        "trust_anchors(51764) 扩展要携带的信任锚 OID 列表（十进制点分，如 "
+        "'52580.200109.1.10'）；空串 '' 表示发送空列表。列表顺序在单次进程内"
+        "固定、进程之间随机，与真实 Chrome 一致"),
     "tls_record_size_limit": (
         "int (1-65535)",
         "record_size_limit 扩展的值"),
@@ -148,10 +150,17 @@ DIY_FP_SPEC: dict[str, tuple[str, str]] = {
         "HTTP/2 流优先级独占标志"),
     "http2_no_priority": (
         "bool",
-        "是否不发送 HTTP/2 PRIORITY 帧"),
+        "是否不发送 HTTP/2 PRIORITY 信息（Safari 的行为）"),
+    "http2_headers_priority": (
+        "bool",
+        "是否在 H2 HEADERS 帧里带上已废弃的 RFC 7540 优先级字段"
+        "（E=1 / 依赖=0 / 权重=256），即 Chrome 的 HEADERS flags=0x25；"
+        "默认跟随 impersonate 预设（Chrome 开、Safari 关），"
+        "与 http2_no_priority=True 互斥。权重用 http2_stream_weight 改"),
     "header_order": (
         "str",
-        "请求头发送顺序（':' 分隔的头名）"),
+        "普通请求头的发送顺序（逗号分隔的头名，大小写不敏感）。列出的头按序排到最前，"
+        "未列出的保持原相对顺序追加在后；HTTP/1.1 与 HTTP/2 都生效"),
     "split_cookies": (
         "bool",
         "是否按浏览器风格把 Cookie 头拆成多行发送"),
@@ -292,6 +301,8 @@ class FingerprintOverrides:
     stream_exclusive: int | None = None
     header_order: str | None = None
     split_cookies: bool | None = None
+    # H2 HEADERS 帧里是否带已废弃的 RFC 7540 优先级字段（Chrome flags=0x25）
+    http2_headers_priority: bool | None = None
 
     # ------------------------------------------------------------------ #
     def merge(self, other: "FingerprintOverrides") -> "FingerprintOverrides":
@@ -363,6 +374,11 @@ class FingerprintOverrides:
             _int_field(self.stream_weight, "http2_stream_weight", 0, 256)
         if self.stream_exclusive is not None:
             _int_field(self.stream_exclusive, "http2_stream_exclusive", 0, 1)
+        if self.http2_headers_priority is not None and self.http2_no_priority:
+            raise FingerprintError(
+                "http2_headers_priority 与 http2_no_priority 互斥："
+                "http2_no_priority=True 表示不发优先级，不能再要求带上优先级字段"
+            )
         return self
 
     # ------------------------------------------------------------------ #

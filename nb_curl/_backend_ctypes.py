@@ -12,6 +12,8 @@ from __future__ import annotations
 import ctypes
 import os
 
+from ._curlopt_generated import CurlOpt
+
 __all__ = ["CtypesBackend", "NativeError"]
 
 _IS_WIN = os.name == "nt"
@@ -84,6 +86,8 @@ class _NbFingerprint(ctypes.Structure):
         ("stream_exclusive", ctypes.c_int32),
         ("header_order", ctypes.c_char_p),
         ("split_cookies", ctypes.c_int32),
+        # 必须与 C 端一致地放在末尾
+        ("http2_headers_priority", ctypes.c_int32),
     ]
 
 
@@ -95,6 +99,40 @@ _FP_FIELDS: tuple[tuple[str, str], ...] = tuple(
 )
 
 _c_char_p_p = ctypes.POINTER(ctypes.c_char_p)
+
+
+class _NbTcpShape(ctypes.Structure):
+    """必须与 C 端 nb_tcp_shape 结构体逐字段一致。
+
+    ``window`` / ``wscale`` 不下发（只用于回读比对），真正生效的是 ``rcvbuf``。
+    """
+
+    _fields_ = [
+        ("ttl", ctypes.c_int32),
+        ("mss", ctypes.c_int32),
+        ("window", ctypes.c_int32),
+        ("wscale", ctypes.c_int32),
+        ("rcvbuf", ctypes.c_int32),
+        ("timestamp", ctypes.c_int32),
+    ]
+
+
+class _NbTcpShapeActual(ctypes.Structure):
+    """必须与 C 端 nb_tcp_shape_actual 结构体逐字段一致（-1 = 读不到）。"""
+
+    _fields_ = [
+        ("ttl", ctypes.c_int32),
+        ("mss", ctypes.c_int32),
+        ("wscale", ctypes.c_int32),
+        ("window", ctypes.c_int32),
+        ("rcvbuf", ctypes.c_int32),
+        ("timestamp", ctypes.c_int32),
+    ]
+
+
+# 下发时按名字对齐（顺序必须与 C 端 nb_tcp_shape 一致）
+_TCP_SHAPE_FIELDS = ("ttl", "mss", "window", "wscale", "rcvbuf", "timestamp")
+_TCP_ACTUAL_FIELDS = ("ttl", "mss", "wscale", "window", "rcvbuf", "timestamp")
 
 
 class CtypesBackend:
@@ -149,6 +187,33 @@ class CtypesBackend:
         self.easy_set_verbose = sig("easy_set_verbose", c_int, [c_void_p, c_int])
         self.easy_set_fresh_connect = sig("easy_set_fresh_connect", c_int, [c_void_p, c_int])
         self._curl_easy_setopt = sig("_curl_easy_setopt", c_int, [c_void_p, c_int, c_void_p])
+
+        # TCP 层画像（JA4T）
+        self._easy_set_tcp_shape = sig(
+            "easy_set_tcp_shape", c_int, [c_void_p, ctypes.POINTER(_NbTcpShape)])
+        self._easy_get_tcp_shape_error = sig("easy_get_tcp_shape_error", c_char_p, [c_void_p])
+        self._easy_check_tcp_shape = sig(
+            "easy_check_tcp_shape", c_int,
+            [c_void_p, ctypes.POINTER(_NbTcpShapeActual)])
+
+        # 通用 setopt 直传
+        self.easy_set_option_long = sig(
+            "easy_set_option_long", c_int, [c_void_p, c_int, c_long])
+        self.easy_set_option_string = sig(
+            "easy_set_option_string", c_int, [c_void_p, c_int, c_char_p])
+        self._easy_set_option_slist = sig(
+            "easy_set_option_slist", c_int, [c_void_p, c_int, _c_char_p_p, c_int])
+        self.easy_set_option_off = sig(
+            "easy_set_option_off", c_int, [c_void_p, c_int, ctypes.c_longlong])
+
+        # WebSocket
+        self._easy_ws_send = sig(
+            "easy_ws_send", c_int, [c_void_p, c_char_p, c_int, c_int])
+        self._easy_ws_recv = sig(
+            "easy_ws_recv", c_int,
+            [c_void_p, ctypes.c_char, c_int,
+             ctypes.POINTER(c_int), ctypes.POINTER(c_int),
+             ctypes.POINTER(ctypes.c_longlong), ctypes.POINTER(ctypes.c_longlong)])
 
         self._easy_perform = sig(
             "easy_perform", c_int,
@@ -216,6 +281,42 @@ class CtypesBackend:
         fn.restype = ctypes.c_int
         fn.argtypes = [ctypes.c_void_p, _c_char_p_p, ctypes.c_int]
         return fn(handle, array, len(lines))
+
+    # -- DNS 覆盖 ---------------------------------------------------------- #
+    def easy_set_resolve(self, handle, entries: list[bytes]) -> int:
+        array = (ctypes.c_char_p * (len(entries) or 1))()
+        for i, entry in enumerate(entries):
+            array[i] = entry
+        fn = getattr(self._dll, "easy_set_resolve")
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_void_p, _c_char_p_p, ctypes.c_int]
+        return fn(handle, array, len(entries))
+
+    # -- TCP 层画像（JA4T） ----------------------------------------------- #
+    def easy_set_tcp_shape(self, handle, *, ttl=None, mss=None, window=None,
+                           wscale=None, rcvbuf=None, timestamp=None) -> int:
+        """下发 socket 级 TCP 画像；六个字段全不给 = 取消画像。
+
+        缺省项写 -1（C 端约定：-1 = 不设置、跟随本机）。``window`` / ``wscale``
+        只用于回读比对，真正下发的是折算好的 ``rcvbuf``。
+        """
+        values = (ttl, mss, window, wscale, rcvbuf, timestamp)
+        if all(v is None for v in values):
+            return self._easy_set_tcp_shape(handle, None)
+        st = _NbTcpShape(*(-1 if v is None else int(v) for v in values))
+        return self._easy_set_tcp_shape(handle, ctypes.byref(st))
+
+    def easy_get_tcp_shape_error(self, handle):
+        """perform 期间 socket 层设置失败的原因；没失败返回 ``None``。"""
+        raw = self._easy_get_tcp_shape_error(handle)
+        return raw.decode("utf-8", "replace") if raw else None
+
+    def easy_check_tcp_shape(self, handle):
+        """连接期间回读到的 socket 快照（dict）；没建新连接 / 读不到返回 ``None``。"""
+        out = _NbTcpShapeActual()
+        if self._easy_check_tcp_shape(handle, ctypes.byref(out)) != 0:
+            return None
+        return {name: int(getattr(out, name)) for name in _TCP_ACTUAL_FIELDS}
 
     # -- 执行 -------------------------------------------------------------- #
     def perform(self, handle):
@@ -285,3 +386,75 @@ class CtypesBackend:
     def version(self) -> str:
         v = self._easy_version()
         return v.decode("utf-8", "replace") if v else ""
+
+    # -- 流式下载（stream=True） ------------------------------------------- #
+    #: size_t(char *, size_t, size_t, void *)
+    _STREAM_CB = ctypes.CFUNCTYPE(ctypes.c_size_t, ctypes.c_void_p,
+                                  ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p)
+
+    def install_stream_callbacks(self, handle, on_chunk, on_header):
+        """把响应体/响应头的回调换成 Python 函数（与 CFFI 后端同一套语义）。
+
+        :param on_chunk: ``f(data: bytes) -> bool``，返回 False 中止传输
+        :param on_header: ``f(line: bytes) -> bool``
+        :returns: 需要**保活到 perform 结束**的对象
+        """
+
+        def _write(ptr, size, nmemb, _ud):
+            n = size * nmemb
+            if not n:
+                return 0
+            # 用 string_at 而不是 c_char_p：响应体可能是二进制，含 \0 不能被截断
+            return n if on_chunk(ctypes.string_at(ptr, n)) else 0
+
+        def _header(ptr, size, nmemb, _ud):
+            n = size * nmemb
+            if not n:
+                return 0
+            return n if on_header(ctypes.string_at(ptr, n)) else 0
+
+        write_cb = self._STREAM_CB(_write)
+        head_cb = self._STREAM_CB(_header)
+        self._curl_easy_setopt(handle, CurlOpt.WRITEFUNCTION,
+                               ctypes.cast(write_cb, ctypes.c_void_p))
+        self._curl_easy_setopt(handle, CurlOpt.HEADERFUNCTION,
+                               ctypes.cast(head_cb, ctypes.c_void_p))
+        return (write_cb, head_cb)
+
+    # -- 通用 setopt 直传 ----------------------------------------------- #
+    def set_option_long(self, handle, option: int, value: int) -> int:
+        return self.easy_set_option_long(handle, option, int(value))
+
+    def set_option_string(self, handle, option: int, value) -> int:
+        if value is None:
+            return self.easy_set_option_string(handle, option, None)
+        if isinstance(value, str):
+            value = value.encode("utf-8")
+        return self.easy_set_option_string(handle, option, value)
+
+    def set_option_slist(self, handle, option: int, entries: list[bytes]) -> int:
+        array = (ctypes.c_char_p * (len(entries) or 1))()
+        for i, entry in enumerate(entries):
+            array[i] = entry
+        return self._easy_set_option_slist(handle, option, array, len(entries))
+
+    def set_option_off(self, handle, option: int, value: int) -> int:
+        return self.easy_set_option_off(handle, option, int(value))
+
+    # -- WebSocket ----------------------------------------------------- #
+    def ws_send(self, handle, buf: bytes, flags: int) -> int:
+        return self._easy_ws_send(handle, buf, len(buf), flags)
+
+    def ws_recv(self, handle, cap: int) -> tuple[int, bytes, int, int, int]:
+        buf = (ctypes.c_char * cap)()
+        nread = ctypes.c_int(0)
+        oflags = ctypes.c_int(0)
+        off = ctypes.c_longlong(0)
+        left = ctypes.c_longlong(0)
+        code = self._easy_ws_recv(
+            handle, buf, cap,
+            ctypes.byref(nread), ctypes.byref(oflags),
+            ctypes.byref(off), ctypes.byref(left))
+        data = ctypes.string_at(buf, nread.value) if nread.value > 0 else b""
+        return int(code), data, int(oflags.value), int(off.value), int(left.value)
+

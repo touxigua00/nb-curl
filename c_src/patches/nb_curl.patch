@@ -1,0 +1,975 @@
+# nb-curl rework patch  (applies on top of curl-impersonate's curl.patch)
+#
+# Base:  upstream curl 8.22.0 (deps/sources/curl-8.22.0-upstream.tar.gz)
+#        + deps/patches/curl.patch (curl-impersonate)
+# Apply: patch -p1 -d curl-8.22.0 < deps/patches/nb_curl.patch
+#
+# This single file is the summary of ALL nb-curl-specific C changes.
+# Every hunk is also annotated in the source with a "Curl_cffi rework:"
+# comment (grep -rn "Curl_cffi rework" lib/).
+#
+# Summary of changes:
+#
+# lib/http2.c
+#   1. cf_h2_peer_fin(): new helper - non-blocking poll + MSG_PEEK to tell
+#      a peer TCP FIN apart from real pending data.
+#   2. http2_data_done(): when the peer is already gone, suppress the
+#      RST_STREAM that upstream flushes after the peer's FIN - browsers
+#      just stop talking instead of writing a 13B frame on a half-closed
+#      socket. THE main fix for "half_close_write" detection.
+#   3. http2_connisalive(): after consuming buffered pending input (which
+#      may hold a TLS close_notify), re-probe the lower filters so a FIN
+#      hiding behind those bytes marks the connection dead and it is not
+#      reused. Caps rounds so a chatty peer cannot spin.
+#   4. cf_h2_connect_done(): flush preface+SETTINGS right after the H2
+#      session is established so they are not coalesced with the first
+#      request HEADERS (browsers send them separately).
+#   5. cf_h2_shutdown(): never close first - wait (up to ~300ms) for the
+#      peer FIN and then answer with a bare FIN; skip GOAWAY.
+#   6. nghttp2_submit_request(): CURLOPT_HTTP2_HEADERS_PRIORITY is now the
+#      single switch for the deprecated RFC 7540 priority fields (E,
+#      dependency, weight) in the HEADERS frame. nghttp2 versions differ:
+#      1.68 and newer ignore the pri_spec handed to nghttp2_submit_request
+#      (the five bytes are inserted by hand in the lower send path
+#      instead), while older ones (1.59, as shipped by e.g. Ubuntu 24.04)
+#      still emit them themselves - which made the option a no-op on those
+#      builds, so pri_spec is gated in http2.c as well. Both paths can be
+#      active at once without duplicating the fields: the send path checks
+#      the priority flag before rewriting.
+#
+# lib/conncache.c
+#   7. cpool_conn_is_alive(): drop the "<1s since last check" shortcut -
+#      always run the alive check, so a server that closes right after
+#      responding is never blindly reused.
+#
+# lib/cf-socket.c
+#   8. cf_socket_close(): send our FIN first (bare half-close) instead of
+#      relying on RST-by-lingering, then drain dangling bytes.
+#   9. cf_socket_is_alive(): on a readable event, MSG_PEEK one byte to
+#      distinguish pending data from EOF before declaring the conn alive.
+#
+# lib/vtls/openssl.c
+#  10. ossl_shutdown(): if the peer already sent a raw FIN, skip sending
+#      our TLS close_notify (writing after the peer half-closed is the
+#      "half-close write" tell) - just mark the connection closed.
+#  11. kMaxSignatureAlgorithmNameLen: static const -> #define so MSVC
+#      accepts it as an array size in C mode.
+#  12. Curl_ossl_ctx_init(): enable SSL_CTX_set_grease_sigalgs_enabled()
+#      when CURLOPT_TLS_GREASE_SIGALGS is set - random GREASE value at the
+#      head of the signature_algorithms extension (Chrome 152+ behavior).
+#  13. set_trust_anchors(): curl-impersonate permutes the trust_anchors
+#      (51764) list with a fresh Curl_rand() draw on EVERY connection. A
+#      live Chrome 152 sent byte-identical 186-byte lists on 30 consecutive
+#      connections and switched to a different order only on a later browser
+#      run: the permutation is fixed for the lifetime of the browser
+#      process. Ours now seeds a xorshift32 once per process, so all
+#      connections of one run agree with each other (and runs still differ).
+#      Only the temporary wire order changes; the configured value stays
+#      untouched, so connection and session cache keys are unaffected.
+#
+# lib/impersonate.c
+#  14. chrome131 / chrome146 / chrome150 / firefox147 presets: default
+#      headers announce Windows instead of macOS (sec-ch-ua-platform and
+#      User-Agent). TLS fingerprint unchanged. New "chrome152" preset,
+#      captured from a real browser (2026-09-11, Windows x64): chrome150
+#      TLS base + GREASE in signature_algorithms (tls_grease_sigalgs) +
+#      trust_anchors(51764) + Chrome 152 default headers.
+#  15. chrome152: trust_anchors(51764) now carries the 28 trust anchor IDs
+#      of Chrome's built-in root store instead of an empty list. It used to
+#      be empty because xcctls.top/all reports the extension without a
+#      dumpable payload, and that empty payload was mistaken for "Chrome
+#      sends an empty list". A real Chrome 152 always sends those 28 IDs
+#      (verified against a live capture, 2026-09-22); they match the
+#      trust_anchor_id fields of Chromium's
+#      net/data/ssl/chrome_root_store/root_store.textproto one for one.
+#      The chrome152 entry also gained the HTTP/3 (QUIC) fingerprint fields
+#      inherited from chrome150, which had been missing from the patch.
+#
+# include/curl/curl.h, lib/urldata.h, lib/setopt.c, lib/easyoptions.c,
+# lib/easy.c, lib/impersonate.h
+#  16. New option CURLOPT_TLS_GREASE_SIGALGS (LONG 1041): data->set ->
+#      SSL_CTX_set_grease_sigalgs_enabled(); wired into the impersonate
+#      options struct so presets can turn it on.
+#
+# lib/vquic/cf-ngtcp2.c
+#  17. (2026-09-16 曾移除，2026-09-17 恢复) H3 custom-settings 支持：
+#      h3_apply_setting / h3_setting_supported / h3_rand_u32 /
+#      h3_generate_grease_setting / h3_settings_count / populate_h3_settings
+#      与 init_ngh3_conn 里的 nghttp3_conn_submit_settings 调用，即
+#      curl-impersonate 原版实现（CURLOPT_HTTP3_SETTINGS 串
+#      "id:value;..." + "GREASE" 令牌）。当时移除的原因是这些符号不在
+#      任何官方版 nghttp3 里；现在我们把 curl-impersonate 的 nghttp3
+#      补丁重定基到 v1.18（deps/patches/nghttp3.patch，应用于
+#      deps/sources/nghttp3-src），补齐了 nghttp3_conn_submit_settings
+#      公开 API，于是原样恢复。chrome150/152 与 firefox147 预设的
+#      H3 SETTINGS 指纹（含 GREASE 条目）由此生效；未设置
+#      CURLOPT_HTTP3_SETTINGS 时行为与官方 curl 一致。
+#
+# lib/vquic/cf-ngtcp2-cmn.c
+#  18. Removed curl-impersonate's raw QUIC transport params override block
+#      (ngtcp2_conn_set_local_transport_params_raw +
+#      ngtcp2_transport_params_raw) in cf_ngtcp2_ctx_setup. These symbols
+#      do NOT exist in ANY stock ngtcp2 release (v1.17.0-v1.25.0 verified);
+#      curl-impersonate's patch requires a custom-forked ngtcp2. QUIC
+#      transport param raw fingerprinting is lost; the tp_raw dynbuf stays
+#      initialized but unconsumed (harmless). Matches curl_cffi's approach.
+#
+--- a/include/curl/curl.h
++++ b/include/curl/curl.h
+@@ -2454,6 +2454,17 @@
+   /* curl-impersonate: Comma-separated TLS trust anchor relative OIDs. */
+   CURLOPT(CURLOPT_TLS_TRUST_ANCHORS, CURLOPTTYPE_STRINGPOINT, 1040),
+ 
++  /* Curl_cffi rework: enable GREASE in the signature_algorithms extension
++   * (random GREASE value at the head of the list, like Chrome 152+). */
++  CURLOPT(CURLOPT_TLS_GREASE_SIGALGS, CURLOPTTYPE_LONG, 1041),
++
++  /* Curl_cffi rework (nb-curl): write the deprecated RFC 7540 priority fields
++   * into outgoing HTTP/2 HEADERS frames. Chrome marks every request HEADERS
++   * frame with the PRIORITY flag (E=1, dependency 0, stream weight); nghttp2
++   * ignores the priority spec given to nghttp2_submit_request nowadays, so the
++   * fields are added to the serialized frame by libcurl itself. */
++  CURLOPT(CURLOPT_HTTP2_HEADERS_PRIORITY, CURLOPTTYPE_LONG, 1042),
++
+   CURLOPT_LASTENTRY /* the last unused */
+ } CURLoption;
+ 
+--- a/lib/cf-socket.c
++++ b/lib/cf-socket.c
+@@ -1058,6 +1058,10 @@
+     if(ctx->sock != CURL_SOCKET_BAD &&
+        ctx->transport == TRNSPRT_TCP &&
+        (curlx_nonblock(ctx->sock, TRUE) >= 0)) {
++      /* Curl_cffi rework: send our FIN first (a bare half-close) so the
++       * connection ends with a clean FIN instead of an RST, then drain any
++       * dangling bytes the peer may have sent. */
++      (void)shutdown(ctx->sock, SHUT_WR);
+       unsigned char buf[1024];
+       (void)sread(ctx->sock, buf, sizeof(buf));
+     }
+@@ -1844,6 +1848,22 @@
+     return FALSE;
+   }
+ 
++  /* Readable event (POLLIN/POLLRDNORM): could be pending data (peer alive)
++   * or a FIN/EOF (peer half-closed). Peek one byte without consuming to
++   * tell them apart. This matters for the TLS close path: after the peer
++   * sent FIN we must NOT write a close_notify, or we trip "half-close
++   * write" detection. */
++#ifdef MSG_PEEK
++  if(pfd[0].revents & (POLLIN | POLLRDNORM)) {
++    char peekbuf[1];
++    ssize_t n = recv(ctx->sock, peekbuf, 1, MSG_PEEK);
++    if(n == 0) {
++      CURL_TRC_CF(data, cf, "is_alive: peer sent FIN, assume dead");
++      return FALSE;
++    }
++  }
++#endif
++
+   CURL_TRC_CF(data, cf, "is_alive: valid events, looks alive");
+   *input_pending = TRUE;
+   return TRUE;
+--- a/lib/conncache.c
++++ b/lib/conncache.c
+@@ -951,9 +951,12 @@
+   DEBUGASSERT(!data->conn);
+   if(!CONN_INUSE(conn) && cpool_conn_maxage(data, conn, pnow)) /* too old? */
+     return FALSE;
+-  if(curlx_ptimediff_ms(pnow, &conn->lastchecked) < 1000)
+-    return TRUE;
+-
++  /* Curl_cffi rework: upstream skips the alive check for connections
++   * checked less than 1s ago. That let a peer-FIN'd connection be reused
++   * (the server closed right after responding), so curl wrote a new
++   * request onto the half-closed socket: "small packet after peer FIN".
++   * Always run the alive check - the socket filter's MSG_PEEK probe makes
++   * this cheap and reliable. */
+   admin = Curl_get_admin(data);
+   if(conn->scheme->run->connection_is_dead) {
+     Curl_attach_connection(admin, conn, FALSE);
+--- a/lib/easy.c
++++ b/lib/easy.c
+@@ -569,6 +569,18 @@
+     if(ret)
+       return ret;
+   }
++  else {
++    /* Curl_cffi rework: presets that do not disable HTTP/2 priority carry the
++     * deprecated RFC 7540 priority fields (E, dependency, weight) inside the
++     * HEADERS frame, which is what the browsers do. nghttp2 no longer honours
++     * the pri_spec handed to nghttp2_submit_request, so the frame is rewritten
++     * by hand on the way out (see lib/http2.c). Explicitly enabled here so that
++     * a plain libcurl handle keeps its stock behaviour of sending no priority.
++     * CURLOPT_HTTP2_HEADERS_PRIORITY still lets a caller turn it back off. */
++    ret = curl_easy_setopt(data, CURLOPT_HTTP2_HEADERS_PRIORITY, 1L);
++    if(ret)
++      return ret;
++  }
+ 
+   if(opts->ech) {
+     ret = curl_easy_setopt(data, CURLOPT_ECH, opts->ech);
+@@ -580,6 +592,12 @@
+   if(ret)
+     return ret;
+ 
++  /* Curl_cffi rework: GREASE in the signature_algorithms extension. */
++  ret = curl_easy_setopt(data, CURLOPT_TLS_GREASE_SIGALGS,
++                         opts->tls_grease_sigalgs ? 1L : 0L);
++  if(ret)
++    return ret;
++
+   if(opts->tls_extension_order) {
+     ret = curl_easy_setopt(data, CURLOPT_TLS_EXTENSION_ORDER,
+                            opts->tls_extension_order);
+--- a/lib/easyoptions.c
++++ b/lib/easyoptions.c
+@@ -136,6 +136,7 @@
+   { "HSTS_CTRL", CURLOPT_HSTS_CTRL, CURLOT_LONG, 0 },
+   { "HTTP09_ALLOWED", CURLOPT_HTTP09_ALLOWED, CURLOT_LONG, 0 },
+   { "HTTP200ALIASES", CURLOPT_HTTP200ALIASES, CURLOT_SLIST, 0 },
++  { "HTTP2_HEADERS_PRIORITY", CURLOPT_HTTP2_HEADERS_PRIORITY, CURLOT_LONG, 0 },
+   { "HTTP2_NO_PRIORITY", CURLOPT_HTTP2_NO_PRIORITY, CURLOT_LONG, 0 },
+   { "HTTP2_PSEUDO_HEADERS_ORDER", CURLOPT_HTTP2_PSEUDO_HEADERS_ORDER,
+     CURLOT_STRING, 0 },
+@@ -402,6 +403,7 @@
+     CURLOT_LONG, 0 },
+   { "TLS_STATUS_REQUEST", CURLOPT_TLS_STATUS_REQUEST, CURLOT_LONG, 0 },
+   { "TLS_TRUST_ANCHORS", CURLOPT_TLS_TRUST_ANCHORS, CURLOT_STRING, 0 },
++  { "TLS_GREASE_SIGALGS", CURLOPT_TLS_GREASE_SIGALGS, CURLOT_LONG, 0 },
+   { "TLS_USE_NEW_ALPS_CODEPOINT", CURLOPT_TLS_USE_NEW_ALPS_CODEPOINT,
+     CURLOT_LONG, 0 },
+   { "TRAILERDATA", CURLOPT_TRAILERDATA, CURLOT_CBPTR, 0 },
+--- a/lib/http2.c
++++ b/lib/http2.c
+@@ -567,6 +567,38 @@
+   return Curl_bufq_is_empty(&ctx->outbufq) ? CURLE_OK : CURLE_AGAIN;
+ }
+ 
++/* Curl_cffi rework: TRUE when the peer has already half-closed the TCP
++ * connection with a bare FIN. Doing a non-blocking peek lets us tell a FIN
++ * apart from real pending data, even after the TLS layer consumed a
++ * close_notify that was sent in front of it. */
++static bool cf_h2_peer_fin(struct Curl_cfilter *cf, struct Curl_easy *data)
++{
++  curl_socket_t sock = Curl_conn_cf_get_socket(cf, data);
++  struct pollfd pfd[1];
++
++  if(sock == CURL_SOCKET_BAD)
++    return TRUE;
++
++  pfd[0].fd = sock;
++  pfd[0].events = POLLIN | POLLRDNORM;
++  pfd[0].revents = 0;
++  if(Curl_poll(pfd, 1, 0) <= 0)
++    return FALSE;                       /* nothing pending: peer still there */
++  if(pfd[0].revents & (POLLERR | POLLHUP | POLLNVAL))
++    return TRUE;                        /* socket broke */
++  if(!(pfd[0].revents & (POLLIN | POLLRDNORM)))
++    return FALSE;
++#ifdef MSG_PEEK
++  {
++    char b[1];
++    ssize_t n = recv(sock, b, 1, MSG_PEEK);
++    return (n == 0);                    /* 0 = EOF/FIN, >0 = real data */
++  }
++#else
++  return FALSE;
++#endif
++}
++
+ static void http2_data_done(struct Curl_cfilter *cf, struct Curl_easy *data)
+ {
+   struct cf_h2_ctx *ctx = cf->ctx;
+@@ -582,14 +614,32 @@
+     (void)nghttp2_session_set_stream_user_data(ctx->h2, stream->id, NULL);
+ 
+     if(!stream->closed && stream->id > 0) {
+-      /* RST_STREAM */
+-      CURL_TRC_CF(data, cf, "[%d] premature DATA_DONE, RST stream",
+-                  stream->id);
+-      stream->closed = TRUE;
+-      stream->reset = TRUE;
+-      nghttp2_submit_rst_stream(ctx->h2, NGHTTP2_FLAG_NONE,
+-                                stream->id, NGHTTP2_STREAM_CLOSED);
+-      flush_egress = TRUE;
++      bool peer_gone = ctx->conn_closed;
++      if(!peer_gone)
++        peer_gone = cf_h2_peer_fin(cf, data);
++      if(peer_gone) {
++        /* Curl_cffi rework: the peer is already gone (our read hit EOF / a
++         * TLS close_notify, and/or a bare TCP FIN is pending). Flushing a
++         * RST_STREAM now puts a small frame on the wire *after* the peer's
++         * FIN - the textbook "half-close write" library tell that L4
++         * behavioural detection looks for. A browser just stops talking.
++         * Drop the stream locally; the connection then ends with a bare
++         * FIN on our side. */
++        CURL_TRC_CF(data, cf, "[%d] peer closed, RST stream suppressed",
++                    stream->id);
++        stream->closed = TRUE;
++        stream->reset = TRUE;
++      }
++      else {
++        /* RST_STREAM */
++        CURL_TRC_CF(data, cf, "[%d] premature DATA_DONE, RST stream",
++                    stream->id);
++        stream->closed = TRUE;
++        stream->reset = TRUE;
++        nghttp2_submit_rst_stream(ctx->h2, NGHTTP2_FLAG_NONE,
++                                  stream->id, NGHTTP2_STREAM_CLOSED);
++        flush_egress = TRUE;
++      }
+     }
+ 
+     if(flush_egress) {
+@@ -715,6 +765,40 @@
+       /* the read failed so let's say this is dead anyway */
+       alive = FALSE;
+     }
++
++    /* Curl_cffi rework: a server that closes right after responding sends
++     * a TLS close_notify followed by its TCP FIN. The peek in the lower
++     * filters saw the pending close_notify bytes and reported "alive";
++     * reading it above consumed those bytes, which exposed the FIN.
++     * Re-probe the lower filters: if the peer half-closed now, the
++     * connection is dead and MUST NOT be reused - writing on it is the
++     * "half-close write" library tell. Cap the rounds so a chatty peer
++     * cannot spin us here. */
++    {
++      int rounds = 0;
++      while(alive && rounds++ < 8) {
++        bool more_pending = FALSE;
++        if(!cf->next || !cf->next->cft->is_alive(cf->next, data,
++                                                 &more_pending)) {
++          alive = FALSE;
++          break;
++        }
++        if(!more_pending)
++          break;
++        result = Curl_cf_recv_bufq(cf->next, data, &ctx->inbufq, 0, &nread);
++        if(result) {
++          if(result != CURLE_AGAIN)
++            alive = FALSE;
++          break;
++        }
++        result = h2_process_pending_input(cf, data);
++        if(result) {
++          alive = FALSE;
++          break;
++        }
++        alive = !should_close_session(ctx);
++      }
++    }
+   }
+ 
+   return alive;
+@@ -751,6 +835,61 @@
+   (void)curl_msnprintf(p, len, "nghttp2/%s", h2->version_str);
+ }
+ 
++/* Curl_cffi rework (nb-curl): Chromium based browsers set the (deprecated)
++ * RFC 7540 PRIORITY flag on every request HEADERS frame and carry E=1,
++ * dependency 0 and the stream weight in it. nghttp2 ignores the priority spec
++ * handed to nghttp2_submit_request these days, so the 5 priority bytes are
++ * inserted into the serialized frame here, right before it reaches the
++ * connection. nghttp2 hands over a frame in one piece as long as it fits into
++ * an output chunk (see NGHTTP2_OB_SEND_DATA in nghttp2), hence "frame length ==
++ * buffer length" below identifies a complete frame starting at the head of
++ * |buf|; a resend after a partial write starts mid frame and is left alone.
++ * Enabled per handle with CURLOPT_HTTP2_HEADERS_PRIORITY. */
++#define H2_PRIORITY_FLAG     0x20
++#define H2_PRIORITY_SPECLEN  5
++
++static bool h2_frame_needs_priority(const uint8_t *buf, size_t blen)
++{
++  size_t flen;
++  if(blen < 9)
++    return FALSE;
++  flen = ((size_t)buf[0] << 16) | ((size_t)buf[1] << 8) | (size_t)buf[2];
++  return (buf[3] == 0x01) &&             /* HEADERS frame */
++         !(buf[4] & H2_PRIORITY_FLAG) && /* no priority fields yet */
++         (blen >= 9 + flen);             /* first frame complete at buf[0] */
++}
++
++/* Return a copy of the HEADERS frame with the priority fields inserted after
++ * the frame header, or NULL when out of memory. */
++static uint8_t *h2_add_priority(const uint8_t *buf, size_t blen,
++                                const struct Curl_easy *data)
++{
++  uint8_t *n = curlx_malloc(blen + H2_PRIORITY_SPECLEN);
++  size_t flen;
++  int weight, exclusive;
++  uint32_t exdep;
++
++  if(!n)
++    return NULL;
++  /* Chrome's values for a navigation request; a preset may override them. */
++  weight = data->set.weight ? data->set.weight : 256;
++  exclusive = data->set.stream_exclusive ? 1 : 0;
++  memcpy(n, buf, 9);
++  flen = blen + H2_PRIORITY_SPECLEN - 9;
++  n[0] = (uint8_t)((flen >> 16) & 0xff);
++  n[1] = (uint8_t)((flen >> 8) & 0xff);
++  n[2] = (uint8_t)(flen & 0xff);
++  n[4] |= H2_PRIORITY_FLAG;
++  exdep = exclusive ? 0x80000000u : 0u;   /* dependency is always 0 */
++  n[9]  = (uint8_t)(exdep >> 24);
++  n[10] = 0;
++  n[11] = 0;
++  n[12] = 0;
++  n[13] = (uint8_t)((weight - 1) & 0xff); /* weight is 1..256 */
++  memcpy(n + 9 + H2_PRIORITY_SPECLEN, buf + 9, blen - 9);
++  return n;
++}
++
+ /*
+  * The implementation of nghttp2_send_callback type. Here we write |data| with
+  * size |length| to the network and return the number of bytes actually
+@@ -770,6 +909,38 @@
+   (void)flags;
+   DEBUGASSERT(data);
+ 
++  if(data->set.http2_headers_priority && !data->set.http2_no_priority &&
++     Curl_bufq_is_empty(&ctx->outbufq) &&
++     (blen + H2_PRIORITY_SPECLEN <= H2_CHUNK_SIZE) &&
++     h2_frame_needs_priority(buf, blen)) {
++    /* An empty queue plus a frame that fits one send chunk guarantees the
++     * rewritten frame enters the queue in one piece. */
++    uint8_t *pri = h2_add_priority(buf, blen, data);
++    if(pri) {
++      size_t plen = blen + H2_PRIORITY_SPECLEN;
++      if(!cf->connected)
++        result = Curl_bufq_write(&ctx->outbufq, pri, plen, &nwritten);
++      else
++        result = Curl_cf_send_bufq(cf->next, data, &ctx->outbufq, pri, plen,
++                                   &nwritten);
++      curlx_free(pri);
++      if(result == CURLE_AGAIN && !nwritten) {
++        /* nothing was queued, the frame is still intact */
++        ctx->nw_out_blocked = 1;
++        return NGHTTP2_ERR_WOULDBLOCK;
++      }
++      if(result || (nwritten != plen)) {
++        /* A partial queue insert cannot be undone. */
++        failf(data, "Failed sending HTTP2 data");
++        return NGHTTP2_ERR_CALLBACK_FAILURE;
++      }
++      /* The frame reached the queue: report the original frame size so that
++       * nghttp2's bookkeeping stays consistent. */
++      return (blen > SSIZE_MAX) ?
++        NGHTTP2_ERR_CALLBACK_FAILURE : (ssize_t)blen;
++    }
++  }
++
+   if(!cf->connected)
+     result = Curl_bufq_write(&ctx->outbufq, buf, blen, &nwritten);
+   else
+@@ -2251,6 +2422,7 @@
+   nghttp2_data_provider data_prd;
+   int32_t stream_id;
+   nghttp2_priority_spec pri_spec;
++  const nghttp2_priority_spec *pri_spec_p;
+   size_t nwritten;
+   CURLcode result = CURLE_OK;
+   uint32_t initial_win_size;
+@@ -2303,6 +2475,20 @@
+       goto out;
+   }
+ 
++  /* Curl_cffi rework: CURLOPT_HTTP2_HEADERS_PRIORITY is the single switch for
++   * the deprecated RFC 7540 priority fields (E, dependency, weight) in the
++   * HEADERS frame. nghttp2 versions differ: 1.68 and newer ignore the pri_spec
++   * handed to nghttp2_submit_request (the 5 bytes are inserted by hand in
++   * send_callback instead), while older ones (1.59, as shipped by e.g. Ubuntu
++   * 24.04) still emit them themselves. Handing pri_spec over unconditionally
++   * made the option a no-op on those builds, so it is gated here as well. Both
++   * paths can be active at once without duplicating the fields: send_callback
++   * checks H2_PRIORITY_FLAG before rewriting. */
++  if(data->set.http2_no_priority || !data->set.http2_headers_priority)
++    pri_spec_p = NULL;
++  else
++    pri_spec_p = &pri_spec;
++
+   switch(data->state.httpreq) {
+   case HTTPREQ_POST:
+   case HTTPREQ_POST_FORM:
+@@ -2311,12 +2497,12 @@
+     data_prd.read_callback = req_body_read_callback;
+     data_prd.source.ptr = NULL;
+     stream_id = nghttp2_submit_request(
+-      ctx->h2, data->set.http2_no_priority ? NULL : &pri_spec, nva, nheader,
++      ctx->h2, pri_spec_p, nva, nheader,
+                                        &data_prd, data);
+     break;
+   default:
+     stream_id = nghttp2_submit_request(
+-      ctx->h2, data->set.http2_no_priority ? NULL : &pri_spec, nva, nheader,
++      ctx->h2, pri_spec_p, nva, nheader,
+                                        NULL, data);
+   }
+ 
+@@ -2742,6 +2928,16 @@
+   cf->connected = TRUE;
+   result = CURLE_OK;
+ 
++  /* Curl_cffi rework: flush the connection preface + SETTINGS immediately
++   * after the HTTP/2 session is established, so they go out as their own
++   * ~70B write and are NOT coalesced with the first request HEADERS.
++   * Real browsers send preface+SETTINGS and the first HEADERS as two
++   * separate frames; deferring the flush here was what merged them. */
++  result = nw_out_flush(cf, data);
++  if(result && (result != CURLE_AGAIN))
++    goto out;
++  result = CURLE_OK;
++
+ out:
+   CURL_TRC_CF(data, cf, "cf_connect() -> %d, %d, ", (int)result, *done);
+   CF_DATA_RESTORE(cf, save);
+@@ -2774,6 +2970,43 @@
+ 
+   CF_DATA_SAVE(save, cf, data);
+ 
++  /* Curl_cffi rework: browsers never close a healthy connection first —
++   * they wait for the peer FIN and reply with a bare FIN. A library that
++   * proactively sends GOAWAY+close_notify+FIN is detectable. Wait up to
++   * ~300ms for the peer FIN, interleaving reads so a buffered close_notify
++   * does not fool us into thinking the peer is still alive. */
++  {
++    curl_socket_t sock = Curl_conn_cf_get_socket(cf, data);
++    bool peer_fin = FALSE;
++    if(sock != CURL_SOCKET_BAD) {
++      int i;
++      struct pollfd pfd[1];
++      pfd[0].fd = sock;
++      pfd[0].events = POLLIN | POLLRDNORM;
++      CURL_TRC_CF(data, cf, "wait for peer FIN before shutdown");
++      for(i = 0; i < 30 && !peer_fin; i++) {
++        char buf[256];
++        ssize_t n = sread(sock, buf, sizeof(buf));
++        if(n == 0) {
++          peer_fin = TRUE;
++          break;
++        }
++        if(n < 0 && SOCKERRNO != SOCKEWOULDBLOCK)
++          break; /* real socket error (e.g. RST): nothing more to wait for */
++        pfd[0].revents = 0;
++        if(Curl_poll(pfd, 1, 10) < 0)
++          break;
++      }
++    }
++    if(peer_fin) {
++      CURL_TRC_CF(data, cf, "peer sent FIN, skip GOAWAY (bare FIN close)");
++      ctx->sent_goaway = TRUE;
++      *done = TRUE;
++      result = CURLE_OK;
++      goto out;
++    }
++  }
++
+   if(!ctx->sent_goaway) {
+     ctx->sent_goaway = TRUE;
+     rv = nghttp2_submit_goaway(ctx->h2, NGHTTP2_FLAG_NONE,
+--- a/lib/impersonate.c
++++ b/lib/impersonate.c
+@@ -553,12 +553,15 @@
+     .tls_permute_extensions = true,
+     .tls_session_ticket = true,
+     .cert_compression = "brotli",
++    /* Curl_cffi rework: desktop presets below announce a Windows platform
++     * in the default headers (upstream curl-impersonate announces macOS).
++     * The TLS fingerprint itself is unchanged - only header defaults. */
+     .http_headers = {
+       "sec-ch-ua: \"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+       "sec-ch-ua-mobile: ?0",
+-      "sec-ch-ua-platform: \"macOS\"",
++      "sec-ch-ua-platform: \"Windows\"",
+       "Upgrade-Insecure-Requests: 1",
+-      "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
++      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+       "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+       "Sec-Fetch-Site: none",
+       "Sec-Fetch-Mode: navigate",
+@@ -926,12 +929,13 @@
+     .tls_permute_extensions = true,
+     .tls_session_ticket = true,
+     .cert_compression = "brotli",
++    /* Curl_cffi rework: Windows platform headers, see chrome131 above. */
+     .http_headers = {
+       "sec-ch-ua: \"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\"",
+       "sec-ch-ua-mobile: ?0",
+-      "sec-ch-ua-platform: \"macOS\"",
++      "sec-ch-ua-platform: \"Windows\"",
+       "Upgrade-Insecure-Requests: 1",
+-      "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
++      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+       "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+       "Sec-Fetch-Site: none",
+       "Sec-Fetch-Mode: navigate",
+@@ -1008,12 +1012,13 @@
+     .tls_permute_extensions = true,
+     .tls_session_ticket = true,
+     .cert_compression = "brotli",
++    /* Curl_cffi rework: Windows platform headers, see chrome131 above. */
+     .http_headers = {
+       "sec-ch-ua: \"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Google Chrome\";v=\"150\"",
+       "sec-ch-ua-mobile: ?0",
+-      "sec-ch-ua-platform: \"macOS\"",
++      "sec-ch-ua-platform: \"Windows\"",
+       "Upgrade-Insecure-Requests: 1",
+-      "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
++      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+       "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+       "Sec-Fetch-Site: none",
+       "Sec-Fetch-Mode: navigate",
+@@ -1041,6 +1046,114 @@
+     .form_boundary = "webkit",
+   },
+   {
++    /* Curl_cffi rework: Chrome 152, captured from a real browser
++     * (2026-09-11, Windows x64, via xcctls.top/all; trust anchor list re-taken
++     * on 2026-09-22 from a live Chrome capture).
++     * Differences vs chrome150:
++     *  - GREASE value at the head of signature_algorithms (tls_grease_sigalgs);
++     *  - trust_anchors (51764) extension carrying the 28 trust anchor IDs of
++     *    Chrome's built-in root store. It used to be an empty list because
++     *    xcctls.top/all reports the extension with no dumpable data; a real
++     *    Chrome 152 always sends those 28 IDs, and they match the
++     *    trust_anchor_id fields of Chromium's
++     *    net/data/ssl/chrome_root_store/root_store.textproto one for one;
++     *  - updated sec-ch-ua / User-Agent headers. */
++    .target = "chrome152",
++    .alias = "chrome152",
++    .httpversion = CURL_HTTP_VERSION_2_0,
++    .ssl_version = CURL_SSLVERSION_TLSv1_2 | CURL_SSLVERSION_MAX_DEFAULT,
++    .ciphers =
++      "TLS_AES_128_GCM_SHA256:"
++      "TLS_AES_256_GCM_SHA384:"
++      "TLS_CHACHA20_POLY1305_SHA256:"
++      "ECDHE-ECDSA-AES128-GCM-SHA256:"
++      "ECDHE-RSA-AES128-GCM-SHA256:"
++      "ECDHE-ECDSA-AES256-GCM-SHA384:"
++      "ECDHE-RSA-AES256-GCM-SHA384:"
++      "ECDHE-ECDSA-CHACHA20-POLY1305:"
++      "ECDHE-RSA-CHACHA20-POLY1305:"
++      "ECDHE-RSA-AES128-SHA:"
++      "ECDHE-RSA-AES256-SHA:"
++      "AES128-GCM-SHA256:"
++      "AES256-GCM-SHA384:"
++      "AES128-SHA:"
++      "AES256-SHA",
++    .curves = "X25519MLKEM768:X25519:P-256:P-384",
++    .sig_hash_algs =
++      "mldsa44:"
++      "mldsa65:"
++      "mldsa87:"
++      "ecdsa_secp256r1_sha256:"
++      "rsa_pss_rsae_sha256:"
++      "rsa_pkcs1_sha256:"
++      "ecdsa_secp384r1_sha384:"
++      "rsa_pss_rsae_sha384:"
++      "rsa_pkcs1_sha384:"
++      "rsa_pss_rsae_sha512:"
++      "rsa_pkcs1_sha512",
++    .npn = false,
++    .alpn = true,
++    .alps = true,
++    .tls_permute_extensions = true,
++    .tls_session_ticket = true,
++    .cert_compression = "brotli",
++    .http_headers = {
++      "sec-ch-ua: \"Chromium\";v=\"152\", \"Not?A_Brand\";v=\"24\", \"Google Chrome\";v=\"152\"",
++      "sec-ch-ua-mobile: ?0",
++      "sec-ch-ua-platform: \"Windows\"",
++      "Upgrade-Insecure-Requests: 1",
++      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
++      "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
++      "Sec-Fetch-Site: none",
++      "Sec-Fetch-Mode: navigate",
++      "Sec-Fetch-User: ?1",
++      "Sec-Fetch-Dest: document",
++      "Accept-Encoding: gzip, deflate, br, zstd",
++      "Accept-Language: zh-CN,zh;q=0.9",
++      "Priority: u=0, i"
++    },
++    .http2_settings = "1:65536;2:0;4:6291456;6:262144",
++    .http2_window_update = 15663105,
++    .http2_stream_weight = 256,
++    .http2_stream_exclusive = 1,
++    /* Curl_cffi rework (nb-curl): H3/QUIC fingerprint fields inherited
++     * from chrome150 (identical in Chrome 152); they were missing from
++     * the original chrome152 entry because it was captured before this
++     * tree had HTTP/3 support. */
++    .http3_sig_hash_algs =
++      "ecdsa_secp256r1_sha256:"
++      "rsa_pss_rsae_sha256:"
++      "rsa_pkcs1_sha256:"
++      "ecdsa_secp384r1_sha384:"
++      "rsa_pss_rsae_sha384:"
++      "rsa_pkcs1_sha384:"
++      "rsa_pss_rsae_sha512:"
++      "rsa_pkcs1_sha512:"
++      "rsa_pkcs1_sha1",
++    .http3_settings = "1:65536;6:262144;7:100;51:1;GREASE",
++    .http3_pseudo_headers_order = "masp",
++    .quic_cid_length = "webkit",
++    .quic_transport_parameters = "1:30000;3:1472;4:15728640;5:6291456;6:6291456;7:6291456;8:100;9:103;15:;17:1@1,GREASE;32:65536;12584:0x4f524947;GREASE",
++    .http3_tls_extension_order = "0-10-13-16-27-43-45-51-57-17613-65037",
++    .ech = "true",
++    .tls_trust_anchors =
++      "52580.200109.1.10,44947.2.1,52580.200109.1.7,11129.9.11,"
++      "44947.2.6,11129.9.5,11129.9.10,44947.2.18,"
++      "52580.200109.1.13,11129.9.8,11129.9.13,11129.9.12,"
++      "52580.200109.1.19,52580.200109.1.12,44947.2.19,"
++      "52580.200109.1.9,11129.9.4,11129.9.1,52580.200109.1.18,"
++      "11129.9.15,44947.2.13,52580.200109.1.8,44947.2.14,"
++      "11129.9.6,44947.2.15,52580.200109.1.11,11129.9.7,"
++      "44947.2.20",
++    .tls_extension_order = NULL,
++    .tls_use_new_alps_codepoint = true,
++    .tls_signed_cert_timestamps = true,
++    .tls_grease = true,
++    .tls_grease_sigalgs = true,
++    .split_cookies = true,
++    .form_boundary = "webkit",
++  },
++  {
+     .target = "chrome99",
+     .alias = "chrome99",
+     .httpversion = CURL_HTTP_VERSION_2_0,
+@@ -1471,8 +1584,9 @@
+       "TLS_RSA_WITH_AES_256_GCM_SHA384:"
+       "TLS_RSA_WITH_AES_128_CBC_SHA:"
+       "TLS_RSA_WITH_AES_256_CBC_SHA",
++    /* Curl_cffi rework: Windows platform headers, see chrome131 above. */
+     .http_headers = {
+-      "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:147.0) Gecko/20100101 Firefox/147.0",
++      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
+       "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+       "Accept-Language: en-US,en;q=0.9",
+       "Accept-Encoding: gzip, deflate, br, zstd",
+--- a/lib/impersonate.h
++++ b/lib/impersonate.h
+@@ -63,6 +63,7 @@
+   int tls_record_size_limit;
+   int tls_key_shares_limit;  // for firefox key_shares extension
+   bool tls_grease;
++  bool tls_grease_sigalgs;  // Curl_cffi rework: GREASE in signature_algorithms
+   int http2_stream_weight;
+   int http2_stream_exclusive;
+   bool http2_no_priority;  // disable http2 priority in header frame
+--- a/lib/setopt.c
++++ b/lib/setopt.c
+@@ -855,6 +855,9 @@
+   case CURLOPT_TLS_GREASE:
+     s->tls_grease = enabled;
+     break;
++  case CURLOPT_TLS_GREASE_SIGALGS:
++    s->tls_grease_sigalgs = enabled;
++    break;
+   case CURLOPT_TLS_KEY_USAGE_NO_CHECK:
+     s->tls_key_usage_no_check = enabled;
+     break;
+@@ -1209,6 +1212,13 @@
+     break;
+ #else
+     return CURLE_NOT_BUILT_IN;
++#endif
++  case CURLOPT_HTTP2_HEADERS_PRIORITY:
++#ifdef USE_HTTP2
++    s->http2_headers_priority = !!arg;
++    break;
++#else
++    return CURLE_NOT_BUILT_IN;
+ #endif
+   case CURLOPT_EXPECT_100_TIMEOUT_MS:
+     result = value_range(&arg, 0, 0, 0xffff);
+--- a/lib/urldata.h
++++ b/lib/urldata.h
+@@ -218,6 +218,7 @@
+   BIT(tls_permute_extensions); /* TLS extension permutations */
+   BIT(tls_use_new_alps_codepoint); /* TLS ALPS new codepoint */
+   BIT(tls_grease);  /* TLS grease? */
++  BIT(tls_grease_sigalgs);  /* TLS grease in signature_algorithms? */
+ #ifndef CURL_DISABLE_DOH
+   BIT(doh);
+ #endif
+@@ -1161,6 +1162,7 @@
+   BIT(ssl_permute_extensions); /* TLS Permute extensions */
+   CURLhttp3sslpermute http3_ssl_permute_extensions;
+   BIT(tls_grease);  /* TLS grease? */
++  BIT(tls_grease_sigalgs);  /* TLS grease in signature_algorithms? */
+   BIT(tls_key_usage_no_check);  /* TLS key_usage_check? */
+   BIT(tls_signed_cert_timestamps);  /* TLS signed cert timestamps? */
+   BIT(tls_status_request);  /* TLS status request */
+@@ -1194,6 +1196,7 @@
+   int tls_record_size_limit;
+   int tls_key_shares_limit;
+   BIT(http2_no_priority);
++  BIT(http2_headers_priority); /* add the priority fields to H2 HEADERS */
+   BIT(stream_exclusive); /* HTTP/2 dependency is exclusive */
+   BIT(post301); /* keep POSTs as POSTs after a 301 request */
+   BIT(post302); /* keep POSTs as POSTs after a 302 request */
+--- a/lib/vquic/cf-ngtcp2-cmn.c
++++ b/lib/vquic/cf-ngtcp2-cmn.c
+@@ -1805,18 +1805,12 @@
+   ctx->conn_ref.get_conn = get_conn;
+   ctx->conn_ref.user_data = cf;
+ 
+-  if(curlx_dyn_len(&ctx->tp_raw)) {
+-    ngtcp2_transport_params_raw raw = {
+-      (const uint8_t *)curlx_dyn_ptr(&ctx->tp_raw),
+-      curlx_dyn_len(&ctx->tp_raw)
+-    };
+-    rc = ngtcp2_conn_set_local_transport_params_raw(ctx->qconn, &raw);
+-    if(rc) {
+-      failf(data, "error setting local QUIC transport params: %s",
+-            ngtcp2_strerror(rc));
+-      return CURLE_QUIC_CONNECT_ERROR;
+-    }
+-  }
++  /* Curl_cffi rework: removed curl-impersonate's raw QUIC transport params
++   * override (ngtcp2_conn_set_local_transport_params_raw +
++   * ngtcp2_transport_params_raw). These symbols do NOT exist in ANY stock
++   * ngtcp2 release (v1.17.0-v1.25.0 verified); curl-impersonate's patch
++   * requires a custom-forked ngtcp2. QUIC transport param raw fingerprinting
++   * is lost; tp_raw dynbuf stays initialized but unconsumed (harmless). */
+ 
+   result = Curl_vquic_tls_init(&ctx->tls, cf, data,
+                                &ctx->ssl_peer, &ALPN_SPEC_H3,
+--- a/lib/vquic/cf-ngtcp2.c
++++ b/lib/vquic/cf-ngtcp2.c
+@@ -423,6 +423,12 @@
+ #pragma GCC diagnostic pop
+ #endif
+ 
++/* Curl_cffi rework: re-enabled curl-impersonate's H3 custom-settings
++ * support.  The nghttp3_conn_submit_settings() /
++ * nghttp3_settings_entry symbols it needs do not exist in upstream
++ * nghttp3, so deps/sources/nghttp3-src carries our rebased port of
++ * curl-impersonate's nghttp3 patch (deps/patches/nghttp3.patch).
++ * Without CURLOPT_HTTP3_SETTINGS the behavior is unchanged. */
+ static void h3_apply_setting(nghttp3_settings *settings,
+                              unsigned long id, uint64_t value)
+ {
+@@ -590,7 +596,6 @@
+   return i;
+ }
+ 
+-
+ static CURLcode init_ngh3_conn(struct Curl_cfilter *cf,
+                                struct Curl_easy *data,
+                                struct cf_ngtcp2_ctx *ctx)
+--- a/lib/vtls/openssl.c
++++ b/lib/vtls/openssl.c
+@@ -190,7 +190,9 @@
+  * kMaxSignatureAlgorithmNameLen and kSignatureAlgorithmNames
+  * Taken from BoringSSL, see ssl/ssl_privkey.cc
+  * */
+-static const size_t kMaxSignatureAlgorithmNameLen = 23;
++/* MSVC C mode: array size needs a compile-time constant expression.
++ * GCC/Clang accept a static const as VLA size, MSVC does not -> macro. */
++#define kMaxSignatureAlgorithmNameLen 23
+ 
+ static const struct {
+   uint16_t signature_algorithm;
+@@ -1982,6 +1984,7 @@
+     goto out;
+   }
+ 
++  /* Curl_cffi rework */
+   connssl->io_need = CURL_SSL_IO_NEED_NONE;
+   *done = FALSE;
+   if(!(SSL_get_shutdown(octx->ssl) & SSL_SENT_SHUTDOWN)) {
+@@ -2019,6 +2022,18 @@
+    * was not complete, we are lacking the close notify from the server. */
+   if(send_shutdown && !(SSL_get_shutdown(octx->ssl) & SSL_SENT_SHUTDOWN)) {
+     int rc;
++    bool input_pending;
++
++    /* If the peer already sent a raw TCP FIN (no TLS close_notify), do NOT
++     * write our close_notify — writing after the peer half-closed is a
++     * "half-close write" and reveals a library. Just mark it closed. */
++    if(!cf->next->cft->is_alive(cf->next, data, &input_pending)) {
++      connssl->peer_closed = TRUE;
++      CURL_TRC_CF(data, cf, "peer already sent FIN, skip close notify");
++      *done = TRUE;
++      goto out;
++    }
++
+     ERR_clear_error();
+     CURL_TRC_CF(data, cf, "send SSL close notify");
+     rc = SSL_shutdown(octx->ssl);
+@@ -4117,6 +4132,18 @@
+ 
+   {
+     const unsigned char *encoded = CBB_data(&ids);
++    /* Curl_cffi rework: Chromium picks one random order for a whole browser
++     * run and keeps it on every connection - a captured Chrome 152 sent the
++     * very same 186 bytes on 30 consecutive connections, and a different
++     * order 30 minutes later. Redrawing the permutation per connection made
++     * our own consecutive connections disagree with each other, which is
++     * something Chrome never does, so derive it from a seed that lives as
++     * long as the process instead. Only the temporary wire order changes; the
++     * configured value stays untouched, so connection and session cache keys
++     * are unaffected. */
++    static bool seeded = FALSE;
++    static unsigned int seed;
++    unsigned int state;
+     size_t i;
+     size_t offset = 0;
+ 
+@@ -4125,23 +4152,30 @@
+       offset += encoded[offset] + 1;
+     }
+ 
+-    /* The IDs form a set. Randomize only the temporary wire order, leaving
+-     * the configured value stable for connection and session cache keys. */
++    if(!seeded) {
++      unsigned char drawn[sizeof(seed)];
++
++      result = Curl_rand(data, drawn, sizeof(drawn));
++      if(result) {
++        failf(data, "failed seeding TLS trust anchor order");
++        goto out;
++      }
++      memcpy(&seed, drawn, sizeof(seed));
++      seeded = TRUE;
++    }
++
++    state = seed ? seed : 1u;
+     for(i = id_count; i > 1; i--) {
+-      size_t random;
+-      size_t threshold = (size_t)(-i) % i;
++      /* xorshift32, seeded once per process: every connection of this process
++       * therefore emits the same permutation. */
+       size_t selected;
+       size_t swap;
+ 
+-      do {
+-        result = Curl_rand(data, (unsigned char *)&random, sizeof(random));
+-        if(result) {
+-          failf(data, "failed randomizing TLS trust anchor list");
+-          goto out;
+-        }
+-      } while(random < threshold);
++      state ^= state << 13;
++      state ^= state >> 17;
++      state ^= state << 5;
++      selected = (size_t)(state % (unsigned int)i);
+ 
+-      selected = random % i;
+       swap = offsets[i - 1];
+       offsets[i - 1] = offsets[selected];
+       offsets[selected] = swap;
+@@ -4474,6 +4508,11 @@
+   else if(data->set.tls_grease)
+     SSL_CTX_set_grease_enabled(octx->ssl_ctx, 1);
+ 
++  /* Curl_cffi rework: random GREASE value at the head of the
++   * signature_algorithms extension (Chrome 152+ behavior). */
++  if(peer->transport != TRNSPRT_QUIC && data->set.tls_grease_sigalgs)
++    SSL_CTX_set_grease_sigalgs_enabled(octx->ssl_ctx, 1);
++
+   if(conn_config->trust_anchors) {
+     CURLcode result = set_trust_anchors(data, octx->ssl_ctx,
+                                         conn_config->trust_anchors);

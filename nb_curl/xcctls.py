@@ -30,6 +30,9 @@
 * 套件/扩展/版本里的 GREASE 值会被过滤，由 ``tls_grease`` 开关统一控制；
 * 签名算法列表里的 GREASE 条目会转成 ``tls_grease_sigalgs`` 开关
   （后端在列表头部插入随机 GREASE 值，与真实 Chrome 行为一致）。
+* ``trust_anchors (51764)`` 只在捕获结果真的带 ``data_hex`` 时才覆盖；
+  xcctls 目前不给这段载荷，此时沿用底座预设自带的信任锚列表，并给一条
+  ``UserWarning``。
 """
 
 from __future__ import annotations
@@ -117,6 +120,48 @@ def _find_ext(extensions: list, ext_id: int) -> Mapping[str, Any] | None:
 def _ext_name(ext: Mapping[str, Any]) -> str:
     ni = _split_named(ext.get("type", ""))
     return (ni[0] if ni else str(ext.get("type", ""))).lower()
+
+
+def _decode_trust_anchors(data_hex: Any) -> str:
+    """trust_anchors (51764) 载荷 -> 逗号分隔的信任锚 OID 列表。
+
+    线格式：``u16 总长`` 后跟若干「``u8`` 长度 + ASN.1 RELATIVE-OID」条目，
+    每个数按 base-128 编码、字节高位置 1 表示还有后续字节。
+    例：``00b8 08 83 9a 64 8c 9b 2d 01 0a ...`` -> ``52580.200109.1.10,...``
+    """
+    raw = re.sub(r"[^0-9a-fA-F]", "", str(data_hex))
+    if not raw or len(raw) % 2:
+        raise FingerprintError(
+            "trust_anchors 载荷不是合法十六进制: %r" % (data_hex,))
+    blob = bytes.fromhex(raw)
+    if len(blob) < 2:
+        raise FingerprintError("trust_anchors 载荷至少要有 2 字节总长字段")
+    total = int.from_bytes(blob[:2], "big")
+    body = blob[2:]
+    if len(body) != total:
+        raise FingerprintError(
+            "trust_anchors 载荷长度不符：声明 %d 字节，实际 %d 字节"
+            % (total, len(body)))
+    out: list[str] = []
+    pos = 0
+    while pos < len(body):
+        ln = body[pos]
+        pos += 1
+        chunk = body[pos:pos + ln]
+        if len(chunk) != ln:
+            raise FingerprintError("trust_anchors 载荷被截断")
+        pos += ln
+        arcs: list[int] = []
+        value = 0
+        for byte in chunk:
+            value = (value << 7) | (byte & 0x7F)
+            if not byte & 0x80:
+                arcs.append(value)
+                value = 0
+        if not arcs:
+            raise FingerprintError("trust_anchors 含空条目")
+        out.append(".".join(str(a) for a in arcs))
+    return ",".join(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -310,9 +355,22 @@ def parse_xcctls(
     if _find_ext(extensions, 5):
         ov.status_request = True
 
-    # --- trust_anchors (51764)：Chrome 152+ 携带的空信任锚列表 ---
-    if _find_ext(extensions, 51764):
-        ov.trust_anchors = ""
+    # --- trust_anchors (51764) ---
+    # xcctls.top/all 对 51764 只给 ``{'type': 'trust_anchors (51764)',
+    # 'data_hex': ''}``：扩展存在，但载荷没被 dump 出来。空串**不代表**
+    # 捕获端发的是空列表（真实的空列表编码是 ``0000``，也就是 data_hex
+    # 应为 "0000"），所以这里不能把"没数据"当成"空列表"写下去——内置预设
+    # 之前就是这么被写成空串的。只有真拿到载荷才覆盖，否则留给底座预设。
+    ta_ext = _find_ext(extensions, 51764)
+    if ta_ext:
+        ta_hex = _as_data(ta_ext).get("data_hex")
+        if isinstance(ta_hex, str) and ta_hex.strip():
+            ov.trust_anchors = _decode_trust_anchors(ta_hex)
+        else:
+            warnings.warn(
+                "捕获结果里 trust_anchors(51764) 没有载荷（data_hex 为空），"
+                "无法得知捕获端发的是哪一份信任锚列表，因此不覆盖该字段，"
+                "继续沿用底座预设自带的列表。", stacklevel=2)
 
     # --- supported_versions -> 最小 TLS 版本 ---
     sv_ext = _find_ext(extensions, 43)

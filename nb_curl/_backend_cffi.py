@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import os
 
+from ._curlopt_generated import CurlOpt
+
 __all__ = ["CffiBackend", "NativeError", "cffi_available"]
 
 
@@ -89,6 +91,7 @@ _FP_FIELDS: tuple[tuple[str, str], ...] = (
     ("http2_pseudo_headers_order", "s"), ("http2_streams", "s"),
     ("http2_no_priority", "i"), ("stream_weight", "i"), ("stream_exclusive", "i"),
     ("header_order", "s"), ("split_cookies", "i"),
+    ("http2_headers_priority", "i"),
 )
 
 
@@ -182,6 +185,16 @@ class CffiBackend:
         _ = (array, cstrings)  # 保活
         return code
 
+    def easy_set_resolve(self, handle, entries: list[bytes]) -> int:
+        ffi = self._ffi
+        if not entries:
+            return self._c.easy_set_resolve(handle, ffi.NULL, 0)
+        cstrings = [ffi.new("char[]", entry) for entry in entries]
+        array = ffi.new("char *[]", cstrings)
+        code = self._c.easy_set_resolve(handle, array, len(entries))
+        _ = (array, cstrings)  # 保活
+        return code
+
     def easy_set_cookies(self, handle, cookies) -> int:
         return self._c.easy_set_cookies(handle, cookies if cookies is not None else self._ffi.NULL)
 
@@ -222,8 +235,109 @@ class CffiBackend:
     def easy_set_fresh_connect(self, handle, on: int) -> int:
         return self._c.easy_set_fresh_connect(handle, on)
 
+    # -- TCP 层画像（JA4T） ---------------------------------------------- #
+    _TCP_FIELDS = ("ttl", "mss", "window", "wscale", "rcvbuf", "timestamp")
+
+    def easy_set_tcp_shape(self, handle, *, ttl=None, mss=None, window=None,
+                           wscale=None, rcvbuf=None, timestamp=None) -> int:
+        """下发 socket 级 TCP 画像；六个字段全不给 = 取消画像。
+
+        缺省项写 -1（C 端约定：-1 = 不设置、跟随本机）。``window`` / ``wscale``
+        只用于回读比对，真正下发的是折算好的 ``rcvbuf``。
+        """
+        values = (ttl, mss, window, wscale, rcvbuf, timestamp)
+        if all(v is None for v in values):
+            return self._c.easy_set_tcp_shape(handle, self._ffi.NULL)
+        st = self._ffi.new("nb_tcp_shape *")
+        for name, value in zip(self._TCP_FIELDS, values):
+            setattr(st, name, -1 if value is None else int(value))
+        return self._c.easy_set_tcp_shape(handle, st)
+
+    def easy_get_tcp_shape_error(self, handle):
+        """perform 期间 socket 层设置失败的原因；没失败返回 ``None``。"""
+        ptr = self._c.easy_get_tcp_shape_error(handle)
+        if ptr == self._ffi.NULL:
+            return None
+        return self._ffi.string(ptr).decode("utf-8", "replace")
+
+    def easy_check_tcp_shape(self, handle):
+        """连接期间回读到的 socket 快照（dict）；没建新连接 / 读不到返回 ``None``。"""
+        out = self._ffi.new("nb_tcp_shape_actual *")
+        if self._c.easy_check_tcp_shape(handle, out) != 0:
+            return None
+        return {name: int(getattr(out, name)) for name in self._TCP_FIELDS}
+
     def _curl_easy_setopt(self, handle, option: int, param) -> int:
         return self._c._curl_easy_setopt(handle, option, param)
+
+    # -- 流式下载（stream=True） ------------------------------------------- #
+    def install_stream_callbacks(self, handle, on_chunk, on_header):
+        """把响应体/响应头的回调换成 Python 函数。
+
+        :param on_chunk: ``f(data: bytes) -> bool`` —— 收到一块响应体，返回 False 中止传输
+        :param on_header: ``f(line: bytes) -> bool`` —— 收到一行响应头（状态行也算）
+        :returns: 需要**保活到 perform 结束**的对象（CFFI 的闭包被 free 掉就会崩）
+
+        用 ``_curl_easy_setopt`` 直接设 ``CURLOPT_WRITEFUNCTION`` / ``HEADERFUNCTION``：
+        C 层已装好的默认回调会被顶掉，所以这两个回调在传输期间完全由 Python 接管
+        —— 数据不再经过 C 层缓冲，每来一块就当场交给调用方。
+        """
+        ffi = self._ffi
+
+        def _write(ptr, size, nmemb, _ud):
+            n = size * nmemb
+            if not n:
+                return 0
+            return n if on_chunk(ffi.buffer(ptr, n)[:]) else 0
+
+        def _header(ptr, size, nmemb, _ud):
+            n = size * nmemb
+            if not n:
+                return 0
+            return n if on_header(ffi.buffer(ptr, n)[:]) else 0
+
+        write_cb = ffi.callback("size_t(char *, size_t, size_t, void *)")(_write)
+        head_cb = ffi.callback("size_t(char *, size_t, size_t, void *)")(_header)
+        self._curl_easy_setopt(handle, CurlOpt.WRITEFUNCTION, ffi.cast("void *", write_cb))
+        self._curl_easy_setopt(handle, CurlOpt.HEADERFUNCTION, ffi.cast("void *", head_cb))
+        return (write_cb, head_cb)
+
+    # -- 通用 setopt 直传 ----------------------------------------------- #
+    def set_option_long(self, handle, option: int, value: int) -> int:
+        return self._c.easy_set_option_long(handle, option, int(value))
+
+    def set_option_string(self, handle, option: int, value) -> int:
+        return self._c.easy_set_option_string(
+            handle, option, value if value is not None else self._ffi.NULL)
+
+    def set_option_slist(self, handle, option: int, entries: list[bytes]) -> int:
+        ffi = self._ffi
+        if not entries:
+            return self._c.easy_set_option_slist(handle, option, ffi.NULL, 0)
+        cstrings = [ffi.new("char[]", entry) for entry in entries]
+        array = ffi.new("char *[]", cstrings)
+        code = self._c.easy_set_option_slist(handle, option, array, len(entries))
+        _ = (array, cstrings)
+        return code
+
+    def set_option_off(self, handle, option: int, value: int) -> int:
+        return self._c.easy_set_option_off(handle, option, int(value))
+
+    # -- WebSocket ----------------------------------------------------- #
+    def ws_send(self, handle, buf: bytes, flags: int) -> int:
+        return self._c.easy_ws_send(handle, buf, len(buf), flags)
+
+    def ws_recv(self, handle, cap: int) -> tuple[int, bytes, int, int, int]:
+        """返回 (code, data, flags, offset, bytesleft)。code=81(CURLE_AGAIN) 表示无数据。"""
+        ffi = self._ffi
+        buf = ffi.new("char[]", cap)
+        nread = ffi.new("int *")
+        oflags = ffi.new("int *")
+        off = ffi.new("long long *")
+        left = ffi.new("long long *")
+        code = self._c.easy_ws_recv(handle, buf, cap, nread, oflags, off, left)
+        data = ffi.buffer(buf, nread[0])[:] if nread[0] > 0 else b""
+        return int(code), data, int(oflags[0]), int(off[0]), int(left[0])
 
     # -- 执行 -------------------------------------------------------------- #
     def perform(self, handle):

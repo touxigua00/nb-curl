@@ -1,0 +1,323 @@
+# nb-curl：nghttp3 (v1.18.x, deps/sources/nghttp3-src) 补丁
+# 目的：公开 HTTP/3 SETTINGS 标识宏与 nghttp3_settings_entry，新增
+#       nghttp3_conn_submit_settings() —— 让 curl 能完全控制客户端
+#       SETTINGS 帧的内容与顺序（HTTP/3 指纹，含 GREASE 条目）。
+# 来源：curl-impersonate 的 nghttp3.patch 手工重定基到 v1.18
+#       （原补丁基于旧版 nghttp3，frame.h / stream.c 两个 hunk 打不上）。
+# 改动标记：注释前缀 "Curl_cffi rework (nb-curl)"，`grep -rn` 可定位。
+# 生成方式：在 deps/sources/nghttp3-src 里改完后 `git diff` 导出。
+# 注意：本补丁只加 API，不改变未提交 settings 时的默认行为。
+
+diff --git a/lib/includes/nghttp3/nghttp3.h b/lib/includes/nghttp3/nghttp3.h
+index d3dd921..c45859b 100644
+--- a/lib/includes/nghttp3/nghttp3.h
++++ b/lib/includes/nghttp3/nghttp3.h
+@@ -1800,6 +1800,59 @@ typedef struct nghttp3_conn nghttp3_conn;
+ #define NGHTTP3_SETTINGS_V4 4
+ #define NGHTTP3_SETTINGS_VERSION NGHTTP3_SETTINGS_V4
+ 
++/* Curl_cffi rework (nb-curl): the following HTTP/3 SETTINGS identifiers,
++   :type:`nghttp3_settings_entry`, and
++   :func:`nghttp3_conn_submit_settings` allow an application to control
++   the exact contents of the client SETTINGS frame (HTTP/3
++   fingerprinting).  Ported from the curl-impersonate nghttp3 patch. */
++
++/**
++ * @macro
++ *
++ * :macro:`NGHTTP3_SETTINGS_ID_MAX_FIELD_SECTION_SIZE` is the HTTP/3
++ * SETTINGS identifier for MAX_FIELD_SECTION_SIZE.
++ */
++#define NGHTTP3_SETTINGS_ID_MAX_FIELD_SECTION_SIZE 0x06U
++/**
++ * @macro
++ *
++ * :macro:`NGHTTP3_SETTINGS_ID_QPACK_MAX_TABLE_CAPACITY` is the
++ * HTTP/3 SETTINGS identifier for QPACK_MAX_TABLE_CAPACITY.
++ */
++#define NGHTTP3_SETTINGS_ID_QPACK_MAX_TABLE_CAPACITY 0x01U
++/**
++ * @macro
++ *
++ * :macro:`NGHTTP3_SETTINGS_ID_QPACK_BLOCKED_STREAMS` is the HTTP/3
++ * SETTINGS identifier for QPACK_BLOCKED_STREAMS.
++ */
++#define NGHTTP3_SETTINGS_ID_QPACK_BLOCKED_STREAMS 0x07U
++/**
++ * @macro
++ *
++ * :macro:`NGHTTP3_SETTINGS_ID_ENABLE_CONNECT_PROTOCOL` is the HTTP/3
++ * SETTINGS identifier for ENABLE_CONNECT_PROTOCOL.
++ */
++#define NGHTTP3_SETTINGS_ID_ENABLE_CONNECT_PROTOCOL 0x08U
++/**
++ * @macro
++ *
++ * :macro:`NGHTTP3_SETTINGS_ID_H3_DATAGRAM` is the HTTP/3 SETTINGS
++ * identifier for H3_DATAGRAM.
++ */
++#define NGHTTP3_SETTINGS_ID_H3_DATAGRAM 0x33U
++
++/**
++ * @struct
++ *
++ * :type:`nghttp3_settings_entry` is an HTTP/3 SETTINGS identifier and
++ * value pair.
++ */
++typedef struct nghttp3_settings_entry {
++  uint64_t id;
++  uint64_t value;
++} nghttp3_settings_entry;
++
+ /**
+  * @struct
+  *
+@@ -2577,6 +2630,35 @@ NGHTTP3_EXTERN int nghttp3_conn_bind_qpack_streams(nghttp3_conn *conn,
+                                                    int64_t qenc_stream_id,
+                                                    int64_t qdec_stream_id);
+ 
++/* Curl_cffi rework (nb-curl): see the comment near
++   NGHTTP3_SETTINGS_ID_MAX_FIELD_SECTION_SIZE above. */
++/**
++ * @function
++ *
++ * `nghttp3_conn_submit_settings` submits SETTINGS entries to be sent
++ * on the control stream in the same order as |iv|.  The entries are
++ * copied by this function, and |iv| does not have to be kept after
++ * this function returns.  |iv| may be NULL if |niv| is 0.  |flags|
++ * is currently ignored and should be 0.
++ *
++ * This function must be called before
++ * `nghttp3_conn_bind_control_stream`.
++ *
++ * This function returns 0 if it succeeds, or one of the following
++ * negative error codes:
++ *
++ * :macro:`NGHTTP3_ERR_INVALID_STATE`
++ *     Control stream has already been bound.
++ * :macro:`NGHTTP3_ERR_INVALID_ARGUMENT`
++ *     |iv| is NULL but |niv| is not 0.
++ * :macro:`NGHTTP3_ERR_NOMEM`
++ *     Out of memory.
++ */
++NGHTTP3_EXTERN int nghttp3_conn_submit_settings(nghttp3_conn *conn,
++                                                uint8_t flags,
++                                                const nghttp3_settings_entry *iv,
++                                                size_t niv);
++
+ /**
+  * @function
+  *
+diff --git a/lib/nghttp3_conn.c b/lib/nghttp3_conn.c
+index 04b50ac..2a2d63b 100644
+--- a/lib/nghttp3_conn.c
++++ b/lib/nghttp3_conn.c
+@@ -438,6 +438,8 @@ void nghttp3_conn_del(nghttp3_conn *conn) {
+   nghttp3_objalloc_free(&conn->stream_objalloc);
+   nghttp3_objalloc_free(&conn->out_chunk_objalloc);
+ 
++  /* Curl_cffi rework (nb-curl) */
++  nghttp3_mem_free(conn->mem, conn->local.settings_iv);
+   nghttp3_mem_free(conn->mem, conn->rx.originbuf);
+ 
+   nghttp3_mem_free(conn->mem, conn);
+@@ -2190,10 +2192,22 @@ int nghttp3_conn_bind_control_stream(nghttp3_conn *conn, int64_t stream_id) {
+     return rv;
+   }
+ 
+-  fr->settings = (nghttp3_frame_settings){
+-    .type = NGHTTP3_FRAME_SETTINGS,
+-    .local_settings = &conn->local.settings,
+-  };
++  /* Curl_cffi rework (nb-curl): if the application submitted settings
++     via nghttp3_conn_submit_settings(), send those entries verbatim
++     (same order) instead of deriving them from local settings. */
++  if (conn->local.settings_submitted) {
++    fr->settings = (nghttp3_frame_settings){
++      .type = NGHTTP3_FRAME_SETTINGS,
++      .niv = conn->local.settings_niv,
++      .iv = conn->local.settings_iv,
++    };
++  }
++  else {
++    fr->settings = (nghttp3_frame_settings){
++      .type = NGHTTP3_FRAME_SETTINGS,
++      .local_settings = &conn->local.settings,
++    };
++  }
+ 
+   if (conn->local.settings.origin_list) {
+     assert(conn->server);
+@@ -2212,6 +2226,42 @@ int nghttp3_conn_bind_control_stream(nghttp3_conn *conn, int64_t stream_id) {
+   return 0;
+ }
+ 
++/* Curl_cffi rework (nb-curl) */
++int nghttp3_conn_submit_settings(nghttp3_conn *conn, uint8_t flags,
++                                 const nghttp3_settings_entry *iv,
++                                 size_t niv) {
++  nghttp3_settings_entry *niv_copy = NULL;
++  (void)flags;
++
++  if (conn->tx.ctrl) {
++    return NGHTTP3_ERR_INVALID_STATE;
++  }
++
++  if (niv && iv == NULL) {
++    return NGHTTP3_ERR_INVALID_ARGUMENT;
++  }
++
++  if (niv > SIZE_MAX / sizeof(*niv_copy)) {
++    return NGHTTP3_ERR_NOMEM;
++  }
++
++  if (niv) {
++    niv_copy = nghttp3_mem_malloc(conn->mem, sizeof(*niv_copy) * niv);
++    if (niv_copy == NULL) {
++      return NGHTTP3_ERR_NOMEM;
++    }
++
++    memcpy(niv_copy, iv, sizeof(*niv_copy) * niv);
++  }
++
++  nghttp3_mem_free(conn->mem, conn->local.settings_iv);
++  conn->local.settings_iv = niv_copy;
++  conn->local.settings_niv = niv;
++  conn->local.settings_submitted = 1;
++
++  return 0;
++}
++
+ int nghttp3_conn_bind_qpack_streams(nghttp3_conn *conn, int64_t qenc_stream_id,
+                                     int64_t qdec_stream_id) {
+   nghttp3_stream *stream;
+diff --git a/lib/nghttp3_conn.h b/lib/nghttp3_conn.h
+index 6841b1c..abc1686 100644
+--- a/lib/nghttp3_conn.h
++++ b/lib/nghttp3_conn.h
+@@ -100,6 +100,11 @@ struct nghttp3_conn {
+        object is initialized as server.  settings.origin_list may
+        point to the address of this field. */
+     nghttp3_vec origin_list;
++    /* Curl_cffi rework (nb-curl): settings_iv points to a copied
++       settings array passed to nghttp3_conn_submit_settings(). */
++    nghttp3_settings_entry *settings_iv;
++    size_t settings_niv;
++    uint8_t settings_submitted;
+     nghttp3_settings settings;
+     struct {
+       /* max_pushes is the number of push IDs that local endpoint can
+diff --git a/lib/nghttp3_frame.h b/lib/nghttp3_frame.h
+index 7806cad..52e7feb 100644
+--- a/lib/nghttp3_frame.h
++++ b/lib/nghttp3_frame.h
+@@ -71,22 +71,14 @@ typedef struct nghttp3_frame_headers {
+   size_t nvlen;
+ } nghttp3_frame_headers;
+ 
+-#define NGHTTP3_SETTINGS_ID_MAX_FIELD_SECTION_SIZE 0x06U
+-#define NGHTTP3_SETTINGS_ID_QPACK_MAX_TABLE_CAPACITY 0x01U
+-#define NGHTTP3_SETTINGS_ID_QPACK_BLOCKED_STREAMS 0x07U
+-#define NGHTTP3_SETTINGS_ID_ENABLE_CONNECT_PROTOCOL 0x08U
+-#define NGHTTP3_SETTINGS_ID_H3_DATAGRAM 0x33U
++/* Curl_cffi rework (nb-curl): NGHTTP3_SETTINGS_ID_* and
++   nghttp3_settings_entry moved to the public nghttp3.h header. */
+ 
+ #define NGHTTP3_H2_SETTINGS_ID_ENABLE_PUSH 0x2U
+ #define NGHTTP3_H2_SETTINGS_ID_MAX_CONCURRENT_STREAMS 0x3U
+ #define NGHTTP3_H2_SETTINGS_ID_INITIAL_WINDOW_SIZE 0x4U
+ #define NGHTTP3_H2_SETTINGS_ID_MAX_FRAME_SIZE 0x5U
+ 
+-typedef struct nghttp3_settings_entry {
+-  uint64_t id;
+-  uint64_t value;
+-} nghttp3_settings_entry;
+-
+ typedef struct nghttp3_frame_settings {
+   uint64_t type;
+   size_t niv;
+diff --git a/lib/nghttp3_stream.c b/lib/nghttp3_stream.c
+index 0929800..84e4952 100644
+--- a/lib/nghttp3_stream.c
++++ b/lib/nghttp3_stream.c
+@@ -333,43 +333,51 @@ int nghttp3_stream_write_settings(nghttp3_stream *stream,
+   nghttp3_buf *chunk;
+   nghttp3_typed_buf tbuf;
+   nghttp3_settings_entry ents[16];
+-  nghttp3_frame_settings fr = {
+-    .type = NGHTTP3_FRAME_SETTINGS,
+-    .niv = 3,
+-    .iv = ents,
+-  };
++  /* Curl_cffi rework (nb-curl): when infr carries entries submitted
++     via nghttp3_conn_submit_settings() (local_settings == NULL), write
++     those entries verbatim instead of deriving them from local
++     settings. */
++  nghttp3_frame_settings fr = *infr;
+   const nghttp3_settings *local_settings = infr->local_settings;
+   uint64_t payloadlen;
+ 
+-  ents[0] = (nghttp3_settings_entry){
+-    .id = NGHTTP3_SETTINGS_ID_MAX_FIELD_SECTION_SIZE,
+-    .value = local_settings->max_field_section_size,
+-  };
+-  ents[1] = (nghttp3_settings_entry){
+-    .id = NGHTTP3_SETTINGS_ID_QPACK_MAX_TABLE_CAPACITY,
+-    .value = local_settings->qpack_max_dtable_capacity,
+-  };
+-  ents[2] = (nghttp3_settings_entry){
+-    .id = NGHTTP3_SETTINGS_ID_QPACK_BLOCKED_STREAMS,
+-    .value = local_settings->qpack_blocked_streams,
+-  };
++  if(local_settings) {
++    fr = (nghttp3_frame_settings){
++      .type = NGHTTP3_FRAME_SETTINGS,
++      .niv = 3,
++      .iv = ents,
++    };
+ 
+-  if (local_settings->h3_datagram) {
+-    ents[fr.niv] = (nghttp3_settings_entry){
+-      .id = NGHTTP3_SETTINGS_ID_H3_DATAGRAM,
+-      .value = 1,
++    ents[0] = (nghttp3_settings_entry){
++      .id = NGHTTP3_SETTINGS_ID_MAX_FIELD_SECTION_SIZE,
++      .value = local_settings->max_field_section_size,
++    };
++    ents[1] = (nghttp3_settings_entry){
++      .id = NGHTTP3_SETTINGS_ID_QPACK_MAX_TABLE_CAPACITY,
++      .value = local_settings->qpack_max_dtable_capacity,
++    };
++    ents[2] = (nghttp3_settings_entry){
++      .id = NGHTTP3_SETTINGS_ID_QPACK_BLOCKED_STREAMS,
++      .value = local_settings->qpack_blocked_streams,
+     };
+ 
+-    ++fr.niv;
+-  }
++    if (local_settings->h3_datagram) {
++      ents[fr.niv] = (nghttp3_settings_entry){
++        .id = NGHTTP3_SETTINGS_ID_H3_DATAGRAM,
++        .value = 1,
++      };
+ 
+-  if (local_settings->enable_connect_protocol) {
+-    ents[fr.niv] = (nghttp3_settings_entry){
+-      .id = NGHTTP3_SETTINGS_ID_ENABLE_CONNECT_PROTOCOL,
+-      .value = 1,
+-    };
++      ++fr.niv;
++    }
++
++    if (local_settings->enable_connect_protocol) {
++      ents[fr.niv] = (nghttp3_settings_entry){
++        .id = NGHTTP3_SETTINGS_ID_ENABLE_CONNECT_PROTOCOL,
++        .value = 1,
++      };
+ 
+-    ++fr.niv;
++      ++fr.niv;
++    }
+   }
+ 
+   len = nghttp3_frame_write_settings_len(&payloadlen, &fr);

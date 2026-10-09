@@ -1,8 +1,8 @@
 # nb-curl
 
 一个**基于 [curl-impersonate](https://github.com/lwthiker/curl-impersonate) 的 Python HTTP 客户端**：
-底层是 libcurl + BoringSSL，可以模拟真实浏览器的 **TLS 指纹（ja3 / ja4）** 和 **HTTP/2 指纹**，
-让 Python 发出去的请求在网络层更贴近浏览器；上层是 requests 风格、简单好用的 API。
+底层是 libcurl + BoringSSL，可以模拟真实浏览器的 **TLS 指纹（ja3 / ja4）**、**HTTP/2 指纹**
+和 **HTTP/3 指纹**，让 Python 发出去的请求在网络层更贴近浏览器；上层是 requests 风格、简单好用的 API。
 
 ```python
 from nb_curl import requests
@@ -19,7 +19,7 @@ print(r.status_code, r.http_version)   # 200 2
 pip install nb-curl
 
 # 或下载 wheel 手动装（Releases 页有 Windows x64 / Linux x86_64）
-pip install nb_curl-0.2.1-py3-none-win_amd64.whl
+pip install nb_curl-0.3.0-py3-none-win_amd64.whl
 ```
 
 支持平台：Windows x64、Linux x86_64。
@@ -34,26 +34,34 @@ pip install nb_curl-0.2.1-py3-none-win_amd64.whl
 
 有个现成的照妖镜可以验证：[https://www.xcctls.top/score](https://www.xcctls.top/score)
 —— 一个给 HTTP 请求打分的检测站，满分 100，从 UA、ECH、TLS ClientHello 各项（与 Chrome 基线逐项比对）、
-HTTP/2 指纹与请求头等维度扣分。内置预设实测：
+HTTP/2 指纹与请求头等维度扣分。同一台机器、同一个检测站，实测评分：
 
-| 预设 | xcctls 评分 |
+| 客户端 | xcctls 评分 |
 | --- | --- |
-| `chrome152` | **95 / 100** |
-| `chrome150` | **95 / 100** |
+| Chrome 浏览器（基线） | **100 / 100** |
+| **nb-curl** | **95 / 100** |
+| requests_go | 85 / 100 |
+| curl_cffi | 79 / 100 |
 
-**并发性能**：
+**能力速览**（★ 越多越强；☆ = 该库不提供这项能力）：
 
-| 指标 | 实测值 |
-| --- | --- |
-| 综合加权得分 | **3.24 / 5**（6 库中最高） |
-| 明文 HTTP/1.1 · 100 线程 | **4903 RPS**（P50 15.9 ms / P95 25.7 ms） |
-| TLS + HTTP/2 · 100 线程 | **4492 RPS** |
-| TLS + HTTP/2 · 异步 100 并发 | **3207 RPS** |
-| 每请求 CPU（并发 50） | **0.36 ms** |
-| 冷连接「建连 → 首字节」P50 | **7.58 ms** |
-| 各场景错误率 | **0.0%** |
+| 库 | HTTP/2 | HTTP/3 | 异步 | WebSocket | 指纹模拟 | 性能 |
+| --- | :--: | :--: | :--: | :--: | :--: | :--: |
+| **nb-curl** | ★★★★★ | ★★★★★ | ★★★★★ | ★★★★★ | ★★★★★ | ★★★★☆ |
+| curl_cffi | ★★★★★ | ★★★★★ | ★★★★★ | ★★★★★ | ★★★★☆ | ★★★☆☆ |
+| requests_go | ★★★★★ | ☆☆☆☆☆ | ☆☆☆☆☆ | ☆☆☆☆☆ | ★★★★☆ | ★★★☆☆ |
+| httpx | ★★★★☆ | ☆☆☆☆☆ | ★★★★☆ | ☆☆☆☆☆ | ☆☆☆☆☆ | ★★☆☆☆ |
+| aiohttp | ☆☆☆☆☆ | ☆☆☆☆☆ | ★★★★★ | ★★★★★ | ☆☆☆☆☆ | ★★★★★ |
+| requests | ☆☆☆☆☆ | ☆☆☆☆☆ | ☆☆☆☆☆ | ☆☆☆☆☆ | ☆☆☆☆☆ | ★★★☆☆ |
 
-这是"高并发时仍然保持完整浏览器指纹"的实测表现。
+「性能」看的是各库在最擅长模型下的吞吐与 CPU 效率（并发 64～1024）。星级只是粗略归纳，
+具体数字与口径见下方报告。
+
+> **[→ 完整对比评测报告](https://htmlpreview.github.io/?https://github.com/touxigua00/nb-curl/blob/main/benchmarks/report.html)**
+> —— nb-curl 与 requests / aiohttp / httpx / curl_cffi / requests_go 六个库的
+> **功能、性能、指纹评分**横向对比（同一台服务端、同一套探针，每一格都是实测）。
+> 报告是单文件 HTML，仓库内路径：
+> [`benchmarks/report.html`](https://github.com/touxigua00/nb-curl/blob/main/benchmarks/report.html)。
 
 > 想直观看自己的裸指纹长什么样：[https://www.xcctls.top/all](https://www.xcctls.top/all)
 > 会把你这台客户端的 **TLS ClientHello 结构 + ja3 + ja4 + HTTP/2 SETTINGS / akamai 指纹 + 请求头**
@@ -81,36 +89,25 @@ with nb_curl.Session(impersonate="chrome146") as s:
     s.get("https://example.com/profile")
 ```
 
-### 异步 —— 用 `with`
+### 异步
 
 ```python
 import asyncio
 import nb_curl
 
 async def main():
+    # 推荐：with 会自动关闭
     async with nb_curl.AsyncSession(impersonate="chrome152", max_clients=20) as s:
         r = await s.get("https://example.com")
         print(r.status_code)
+        rs = await asyncio.gather(*[s.get(u) for u in urls])    # 并发
 
-        # 并发
-        rs = await asyncio.gather(*[s.get(u) for u in urls])
-
-asyncio.run(main())
-```
-
-### 异步 —— 不用 `with`
-
-```python
-import asyncio
-import nb_curl
-
-async def main():
+    # 不想用 with，就自己收尾 —— close() 是 async 方法，要 await
     s = nb_curl.AsyncSession(impersonate="chrome152", max_clients=20)
     try:
         r = await s.get("https://example.com")
-        print(r.status_code)
     finally:
-        await s.close()          # close() 是 async 方法，要 await
+        await s.close()
 
 asyncio.run(main())
 ```
@@ -120,16 +117,78 @@ asyncio.run(main())
 ```python
 nb_curl.get(
     url,
-    http_version="1.1",                              # 强制 HTTP 版本
+    http_version="1.1",                              # 强制 HTTP 版本；换成 "3" 或 30 就是 HTTP/3
     proxies={"https": "socks5h://127.0.0.1:7890"},   # 代理
+    tcp="64240_2-1-3-1-1-4_1400_8",                  # TCP 层画像（JA4T）
+    h2_priority=False,                               # HEADERS 帧不带优先级字段
     verify=False,                                    # 不校验证书
     allow_redirects=False,                           # 不跟随跳转
 )
 ```
 
+### 参数忘了怎么传？查这里
+
+所有支持的参数、每个参数的合法取值，都能直接在运行时查出来 —— 不用翻文档：
+
+```python
+import nb_curl
+
+print(nb_curl.params.describe())         # 全部参数一览（带取值说明）
+print(nb_curl.params.describe("tcp"))    # 只看一个参数
+help(nb_curl.params.RequestOptions)      # 类型定义 + 逐项说明
+```
+
+像 `tcp`、`resolve`、`http_version` 这种「知道能传字典、但不知道键怎么填」的参数，
+输出里都写明了键名、取值范围和示例。
+
+参数名写错不会被静默忽略，会在发请求前直接报 `TypeError`，并提示最接近的合法参数名。
+
+### TCP 层画像（JA4T）
+
+`tcp=` 在**建连之前**按 socket 设定 TCP 层参数，让 JA4T 画像和目标一致。
+它收**完整的 JA4T 值**（`"窗口_选项顺序_MSS_窗口缩放"`），也收只写关心字段的 dict：
+
+```python
+nb_curl.get(url, tcp="64240_2-1-3-1-1-4_1400_8")     # 完整值
+nb_curl.Session(tcp={"window": 64240, "wscale": 0})   # 只给关心的字段
+nb_curl.get(url, ttl=77)                              # 只改 TTL（也可写进 tcp=）
+nb_curl.get(url, timestamps=True)                     # TCP 时间戳
+```
+
+三条约定：
+
+- **本机做不到的项只发警告，不报错**，请求照发，只是该项不生效。
+  关掉警告：`nb_curl.set_tcp_warnings(False)`，或
+  `warnings.simplefilter("ignore", nb_curl.TCPShapeWarning)`。
+  只有画像串本身写错（格式 / 类型 / 取值越界）才抛 `nb_curl.TCPShapeError`。
+- **默认窗口绝不被改动**：只要给出的 `window` / `wscale` 这一对不能同时精确达成，
+  就完全不碰本机窗口（Windows 上常见 `64240`），只发一条警告说明哪一项做不到。
+- **TCP option 顺序任何系统都改不了**（写在内核里，没有接口），顺序段只能填本机原生值，
+  否则发警告：Windows `2-1-3-1-1-4`、Linux `2-4-8-1-3`。
+
+各观测点的平台能力、落点、能不能回读证实，用 `nb_curl.tcp_support()` 查：
+
+```python
+nb_curl.tcp_support()
+# {'platform': ..., 'native_order': '2-1-3-1-1-4',
+#  'knobs': {'ttl': True, 'mss': True, 'window': True, 'wscale': True, 'timestamp': True},
+#  'verifiable': {...}, 'mss_mechanism': 'interface-mtu', 'ts_mechanism': 'socket', ...}
+```
+
+Linux 上 MSS 逐 socket 生效（`mss=1200` 时对端读到的就是 `1200`，走 `TCP_MAXSEG`）；
+Windows 上只能靠改网卡 MTU（`MSS = MTU - 40`，需管理员）。TTL 是最便宜也最有效的一项 ——
+检测站按 TTL 判 OS，只改 options 不改 TTL 会被判成 `Unknown`。
+
+### HTTP/2 优先级字段
+
+`h2_priority=` 控制 HEADERS 帧里是否带 RFC 7540 的优先级字段（`E` / 依赖 / 权重）。
+Chrome 系导航请求默认带（HEADERS flags `0x25`），需要「不带」时用 `h2_priority=False`
+（flags `0x05`）。不传则跟随所选指纹预设。与 `diy_fp` 的 `http2_no_priority`
+互斥，两个一起给会报 `FingerprintError`。
+
 ---
 
-## TLS / HTTP2 指纹模拟
+## TLS / HTTP2 / HTTP3 指纹模拟
 
 指纹有两种来源：**内置预设**（C 内核，零开销）和**运行时自定义**（灵活，不用重编译）。
 
@@ -206,6 +265,33 @@ nb_curl.get(url, impersonate="chrome150", diy_fp={
 
 可用键见 `nb_curl.diy_fp_fields()`，拼错会直接报错，不会静默忽略。
 
+#### `trust_anchors`（扩展 51764）—— 内置预设已带，通常不用管
+
+Chrome 152 的 ClientHello 多了一个 `trust_anchors(51764)` 扩展，载荷是 Chrome 内置
+根存储里每张根证书的编号。**`chrome152` 预设默认就发这 28 项**，你什么都不用配；
+只有要换一份时才写：
+
+```python
+# 默认：自带 Chrome 的 28 项
+nb_curl.get(url, impersonate="chrome152")
+
+# 换成自己的列表（逗号分隔的十进制点分 OID）
+nb_curl.get(url, impersonate="chrome152",
+            diy_fp={"tls_trust_anchors": "52580.200109.1.10,11129.9.1"})
+
+# 显式发空列表（线格式 "0000"，和"扩展不存在"不是一回事）
+nb_curl.get(url, impersonate="chrome152",
+            diy_fp={"tls_trust_anchors": ""})
+```
+
+排列在**单次进程内固定**、换进程才可能变 —— 与真实 Chrome 一致（一次运行内几十条
+连接字节全同）。想确认线上到底发了什么，跑仓库里的离线示例
+（用"只收不答"的本地监听截下第一条 ClientHello 再解扩展表）：
+
+```bash
+python examples/trust_anchors_demo.py
+```
+
 #### `fp_file` —— 一键复刻真实浏览器（最省事）
 
 **这是最简单的方式：不用懂上面任何参数。**
@@ -259,6 +345,23 @@ nb_curl.get(url, diy_fp={"tls_cert_compression": "lz4"})
 
 ---
 
+## HTTP/3
+
+**nb-curl 支持 HTTP/3**（底层 ngtcp2 + nghttp3）。`http_version="3"` 就走 H3，
+服务端不支持时自动回退到 H2 / TLS；想要「不回退」用 `"3only"`（不支持直接报错）。
+
+```python
+# http_version 的字符串写法与数字写法完全等价，填哪一种都行：
+#   "1.0" = 10    "1.1" = 11    "2" = 20    "2.0" = 20    "3" = 30    "3.0" = 30
+r = nb_curl.get("https://h3.xcctls.top/h3_data", impersonate="chrome152", http_version="3")
+print(r.status_code, r.http_version)      # 200 3
+```
+
+想确认某条连接是否**真的**走了 HTTP/3、并查看这条连接的详细信息，访问
+[https://h3.xcctls.top/h3_data](https://h3.xcctls.top/h3_data)。
+
+---
+
 ## 常见问题
 
 **Q：指纹改了不生效？**
@@ -275,6 +378,39 @@ TLS 指纹只在**建立连接**时生效，连接一旦建立就固定了。nb-
 只写一个键也行，`proxies={"https": ...}` 或 `proxies={"all": ...}` 都能覆盖全部请求；
 但只写 `{"http": ...}` 时 https 请求不走代理（直连）。`proxy` 与 `proxies` 同时给出时 `proxy` 优先。
 
+**Q：超时、请求头写错、域名解析不了……怎么全都报 `proxy handshake error`（curl 97）？**
+因为 97 是**代理握手失败**，而握手发生在请求发出之前 —— 后面那些问题还没轮到就被它盖住了。
+换句话说：不是报错不准，是每次请求都倒在代理那一步。看报错文案补的两行即可定位：
+
+```text
+proxy handshake error (curl 97 CURLE_PROXY，…)
+  代理子原因 2 CURLPX_BAD_VERSION，对端回的版本号不是 SOCKS4/5，该端口多半不是代理或代理类型配错了
+  本次请求走了代理 ALL_PROXY=socks5://127.0.0.1:1080；若不是本意，传 proxy="" 显式禁用，…
+```
+
+常见原因是代理地址写错、协议配错（把 HTTP 代理当 SOCKS 用），或环境变量
+`http_proxy` / `https_proxy` / `all_proxy` 里留了个失效的代理。不想走代理就传
+`proxy=""`（空串 = 显式禁用，连环境变量也不看）。
+
+顺带一个容易踩的点：Windows 上 `HTTPS_PROXY` 与 `https_proxy` 会被当成两条记录各存一份，
+而 `os.environ.pop("https_proxy")` 只会删掉其中一条 —— 想彻底清掉就得两种大小写各删一次，
+否则会出现「Python 里删干净了、请求却还在走代理」。最省事的办法仍是直接传 `proxy=""`。
+
+---
+
+## 想自己编 C 内核？（可选，普通用户不用看）
+
+wheel 里已经带好了编译好的 C 内核，**pip 装完就能用**。如果你要从源码重建它，
+重建所需的材料都在 [`c_src/`](c_src/) 里：
+
+| 目录 | 内容 |
+| --- | --- |
+| `c_src/patches/` | 上游依赖的补丁链 + 本项目增量补丁 `nb_curl.patch` |
+| `c_src/native/` | C 桥接层源码 `nb_curl_bridge.c` / `.h` |
+| `c_src/build/` | 构建脚本（Windows / Linux / Docker）、取源脚本、CFFI 构建脚本 |
+
+具体说明见 [`c_src/README.md`](c_src/README.md)。
+
 ---
 
 ## License
@@ -286,6 +422,7 @@ TLS 指纹只在**建立连接**时生效，连接一旦建立就固定了。nb-
 - **curl**（MIT/X 风格）
 - **BoringSSL**（ISC + OpenSSL 双许可）
 - **nghttp2**（MIT）
+- **ngtcp2** / **nghttp3**（MIT，HTTP/3 的传输层与帧层）
 - **curl-impersonate**（MIT）
 
 ---

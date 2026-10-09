@@ -16,6 +16,9 @@ env/
 native/
 _cffi_build.py
 
+# ---- 本地实验脚本 ----
+tools/
+
 # ---- 本地产物 ----
 build/
 dist/
@@ -35,3 +38,13 @@ Thumbs.db
 # ---- 本地配置 ----
 .env
 .env.*
+
+# ---- c_src/：公开的 C 层源码（补丁 / 桥接层 / 构建脚本），整个目录入库 ----
+# 上面 build/ 与 native/ 两条规则会误伤 c_src/ 内部，这里显式放行
+!c_src/
+!c_src/**
+
+# c_src/ 内仍需忽略的构建垃圾（上面的 !c_src/** 会一并放行，这里收回来）
+c_src/**/__pycache__/
+c_src/**/*.pyc
+c_src/**/*.pyo
