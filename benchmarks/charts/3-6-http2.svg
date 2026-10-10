@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-12 -12 944 146" width="944" height="146" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+<rect x="-12" y="-12" width="944" height="146" fill="#0f1115" rx="10"/>
+<text x="140" y="24" fill="#e7eaf0" font-size="11.5" text-anchor="end">httpx[h2]</text><rect x="150" y="12" width="704" height="15" fill="#1c212b" rx="3"/>
+<rect x="150" y="12" width="348.0" height="15" fill="#f2cf66" rx="3" opacity="0.9"/>
+<text x="505.0" y="24" fill="#e7eaf0" font-size="11">1,483 req/s</text><text x="140" y="50" fill="#e7eaf0" font-size="11.5" text-anchor="end">curl_cffi</text><rect x="150" y="38" width="704" height="15" fill="#1c212b" rx="3"/>
+<rect x="150" y="38" width="439.8" height="15" fill="#7ee787" rx="3" opacity="0.9"/>
+<text x="596.8" y="50" fill="#e7eaf0" font-size="11">1,874 req/s</text><text x="140" y="76" fill="#e7eaf0" font-size="11.5" text-anchor="end">nb_curl</text><rect x="150" y="64" width="704" height="15" fill="#1c212b" rx="3"/>
+<rect x="150" y="64" width="679.2" height="15" fill="#ff9f43" rx="3" opacity="1"/>
+<text x="836.2" y="76" fill="#e7eaf0" font-size="11">2,894 req/s</text><text x="140" y="102" fill="#e7eaf0" font-size="11.5" text-anchor="end">requests_go</text><rect x="150" y="90" width="704" height="15" fill="#1c212b" rx="3"/>
+<rect x="150" y="90" width="289.1" height="15" fill="#c297ff" rx="3" opacity="0.9"/>
+<text x="446.1" y="102" fill="#e7eaf0" font-size="11">1,232 req/s</text>
+</svg>

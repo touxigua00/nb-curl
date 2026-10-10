@@ -57,11 +57,31 @@ HTTP/2 指纹与请求头等维度扣分。同一台机器、同一个检测站�
 「性能」看的是各库在最擅长模型下的吞吐与 CPU 效率（并发 64～1024）。星级只是粗略归纳，
 具体数字与口径见下方报告。
 
-> **[→ 完整对比评测报告](https://htmlpreview.github.io/?https://github.com/touxigua00/nb-curl/blob/main/benchmarks/report.html)**
-> —— nb-curl 与 requests / aiohttp / httpx / curl_cffi / requests_go 六个库的
-> **功能、性能、指纹评分**横向对比（同一台服务端、同一套探针，每一格都是实测）。
-> 报告是单文件 HTML，仓库内路径：
-> [`benchmarks/report.html`](https://github.com/touxigua00/nb-curl/blob/main/benchmarks/report.html)。
+### 性能实测
+
+下面是横向评测里的几张原始图（同一台服务端、同一套探针，每一格都是实测）：
+
+**吞吐随并发的变化** —— 明文 HTTP/1.1，128 字节响应；低并发段看单连接开销，高并发段看调度成本。
+
+![并发吞吐曲线](benchmarks/charts/3-1-throughput-vs-concurrency.svg)
+
+**各并发档位吞吐** —— 同一份数据的柱状视图，便于逐档对比。
+
+![各并发档位吞吐](benchmarks/charts/3-2-throughput-by-concurrency.svg)
+
+**CPU 效率** —— 每请求进程 CPU 毫秒，越低越好；浏览器仿真多做的那部分工作在这里直接量化。
+
+![CPU 效率（每请求进程 CPU 毫秒）](benchmarks/charts/3-4-cpu-per-request.svg)
+
+**指纹评分** —— 第三方检测站 [xcctls](https://www.xcctls.top/score) 打分（满分 100，越高越接近真实 Chrome）。
+
+![请求指纹评分](benchmarks/charts/4-fingerprint-score.svg)
+
+> **[→ 完整评测报告](benchmarks/README.md)** —— GitHub 直接渲染的 Markdown 版，含全部 9 张图
+> 与完整数据表；报告同样提供单文件 HTML 版：[`benchmarks/report.html`](benchmarks/report.html)
+> （[在线预览](https://htmlpreview.github.io/?https://github.com/touxigua00/nb-curl/blob/main/benchmarks/report.html)）。
+> 内容：nb-curl 与 requests / aiohttp / httpx / curl_cffi / requests_go 六个库的
+> **功能、性能、指纹评分**横向对比。
 
 > 想直观看自己的裸指纹长什么样：[https://www.xcctls.top/all](https://www.xcctls.top/all)
 > 会把你这台客户端的 **TLS ClientHello 结构 + ja3 + ja4 + HTTP/2 SETTINGS / akamai 指纹 + 请求头**

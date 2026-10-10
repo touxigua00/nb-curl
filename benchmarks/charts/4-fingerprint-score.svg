@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-12 -12 944 126" width="944" height="126" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+<rect x="-12" y="-12" width="944" height="126" fill="#0f1115" rx="10"/>
+<text x="140" y="25" fill="#e7eaf0" font-size="11.5" text-anchor="end">nb_curl</text><rect x="150" y="12" width="704" height="17" fill="#1c212b" rx="3"/>
+<rect x="150" y="12" width="668.8" height="17" fill="#ff9f43" rx="3" opacity="1"/>
+<text x="825.8" y="25" fill="#e7eaf0" font-size="11">95 分</text><text x="140" y="53" fill="#e7eaf0" font-size="11.5" text-anchor="end">requests_go</text><rect x="150" y="40" width="704" height="17" fill="#1c212b" rx="3"/>
+<rect x="150" y="40" width="598.4" height="17" fill="#c297ff" rx="3" opacity="0.9"/>
+<text x="755.4" y="53" fill="#e7eaf0" font-size="11">85 分</text><text x="140" y="81" fill="#e7eaf0" font-size="11.5" text-anchor="end">curl_cffi</text><rect x="150" y="68" width="704" height="17" fill="#1c212b" rx="3"/>
+<rect x="150" y="68" width="556.2" height="17" fill="#7ee787" rx="3" opacity="0.9"/>
+<text x="713.2" y="81" fill="#e7eaf0" font-size="11">79 分</text>
+</svg>
