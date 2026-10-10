@@ -59,7 +59,7 @@ HTTP/2 指纹与请求头等维度扣分。同一台机器、同一个检测站�
 
 ### 性能实测
 
-下面是横向评测里的几张原始图（同一台服务端、同一套探针，每一格都是实测）：
+下面是横向评测里的几张原始图（客户端与服务端同机回环、各自绑核，每一格都是实测）：
 
 **吞吐随并发的变化** —— 明文 HTTP/1.1，128 字节响应；低并发段看单连接开销，高并发段看调度成本。
 
@@ -69,15 +69,15 @@ HTTP/2 指纹与请求头等维度扣分。同一台机器、同一个检测站�
 
 ![各并发档位吞吐](benchmarks/charts/3-2-throughput-by-concurrency.svg)
 
-**CPU 效率** —— 每请求进程 CPU 毫秒，越低越好；浏览器仿真多做的那部分工作在这里直接量化。
+**CPU 效率** —— 每请求客户端 CPU 毫秒，越低越好；浏览器仿真多做的那部分工作在这里直接量化。
 
-![CPU 效率（每请求进程 CPU 毫秒）](benchmarks/charts/3-4-cpu-per-request.svg)
+![CPU 效率（每请求客户端 CPU 毫秒）](benchmarks/charts/3-4-cpu-per-request.svg)
 
 **指纹评分** —— 第三方检测站 [xcctls](https://www.xcctls.top/score) 打分（满分 100，越高越接近真实 Chrome）。
 
 ![请求指纹评分](benchmarks/charts/4-fingerprint-score.svg)
 
-> **[→ 完整评测报告](benchmarks/README.md)** —— GitHub 直接渲染的 Markdown 版，含全部 9 张图
+> **[→ 完整评测报告](benchmarks/README.md)** —— GitHub 直接渲染的 Markdown 版，含全部 12 张图
 > 与完整数据表；报告同样提供单文件 HTML 版：[`benchmarks/report.html`](benchmarks/report.html)
 > （[在线预览](https://htmlpreview.github.io/?https://github.com/touxigua00/nb-curl/blob/main/benchmarks/report.html)）。
 > 内容：nb-curl 与 requests / aiohttp / httpx / curl_cffi / requests_go 六个库的
