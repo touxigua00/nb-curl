@@ -1,16 +1,16 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="-12 -12 944 198" width="944" height="198" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
 <rect x="-12" y="-12" width="944" height="198" fill="#0f1115" rx="10"/>
 <text x="140" y="24" fill="#e7eaf0" font-size="11.5" text-anchor="end">requests</text><rect x="150" y="12" width="704" height="15" fill="#1c212b" rx="3"/>
-<rect x="150" y="12" width="126.0" height="15" fill="#6ea8fe" rx="3" opacity="0.9"/>
-<text x="283.0" y="24" fill="#e7eaf0" font-size="11">716 req/s</text><text x="140" y="50" fill="#e7eaf0" font-size="11.5" text-anchor="end">aiohttp</text><rect x="150" y="38" width="704" height="15" fill="#1c212b" rx="3"/>
-<rect x="150" y="38" width="564.4" height="15" fill="#f97b72" rx="3" opacity="0.9"/>
-<text x="721.4" y="50" fill="#e7eaf0" font-size="11">3,207 req/s</text><text x="140" y="76" fill="#e7eaf0" font-size="11.5" text-anchor="end">httpx[h1]</text><rect x="150" y="64" width="704" height="15" fill="#1c212b" rx="3"/>
-<rect x="150" y="64" width="139.0" height="15" fill="#f2cf66" rx="3" opacity="0.9"/>
-<text x="296.0" y="76" fill="#e7eaf0" font-size="11">790 req/s</text><text x="140" y="102" fill="#e7eaf0" font-size="11.5" text-anchor="end">curl_cffi</text><rect x="150" y="90" width="704" height="15" fill="#1c212b" rx="3"/>
-<rect x="150" y="90" width="237.8" height="15" fill="#7ee787" rx="3" opacity="0.9"/>
-<text x="394.8" y="102" fill="#e7eaf0" font-size="11">1,351 req/s</text><text x="140" y="128" fill="#e7eaf0" font-size="11.5" text-anchor="end">requests_go</text><rect x="150" y="116" width="704" height="15" fill="#1c212b" rx="3"/>
-<rect x="150" y="116" width="144.8" height="15" fill="#c297ff" rx="3" opacity="0.9"/>
-<text x="301.8" y="128" fill="#e7eaf0" font-size="11">823 req/s</text><text x="140" y="154" fill="#e7eaf0" font-size="11.5" text-anchor="end">nb_curl</text><rect x="150" y="142" width="704" height="15" fill="#1c212b" rx="3"/>
-<rect x="150" y="142" width="272.6" height="15" fill="#ff9f43" rx="3" opacity="1"/>
-<text x="429.6" y="154" fill="#e7eaf0" font-size="11">1,549 req/s</text>
+<rect x="150" y="12" width="124.0" height="15" fill="#6ea8fe" rx="3" opacity="0.9"/>
+<text x="281.0" y="24" fill="#e7eaf0" font-size="11">881 req/s</text><text x="140" y="50" fill="#e7eaf0" font-size="11.5" text-anchor="end">aiohttp</text><rect x="150" y="38" width="704" height="15" fill="#1c212b" rx="3"/>
+<rect x="150" y="38" width="612.1" height="15" fill="#f97b72" rx="3" opacity="0.9"/>
+<text x="769.1" y="50" fill="#e7eaf0" font-size="11">4,347 req/s</text><text x="140" y="76" fill="#e7eaf0" font-size="11.5" text-anchor="end">httpx[h1]</text><rect x="150" y="64" width="704" height="15" fill="#1c212b" rx="3"/>
+<rect x="150" y="64" width="143.7" height="15" fill="#f2cf66" rx="3" opacity="0.9"/>
+<text x="300.7" y="76" fill="#e7eaf0" font-size="11">1,020 req/s</text><text x="140" y="102" fill="#e7eaf0" font-size="11.5" text-anchor="end">curl_cffi</text><rect x="150" y="90" width="704" height="15" fill="#1c212b" rx="3"/>
+<rect x="150" y="90" width="228.5" height="15" fill="#7ee787" rx="3" opacity="0.9"/>
+<text x="385.5" y="102" fill="#e7eaf0" font-size="11">1,623 req/s</text><text x="140" y="128" fill="#e7eaf0" font-size="11.5" text-anchor="end">requests_go</text><rect x="150" y="116" width="704" height="15" fill="#1c212b" rx="3"/>
+<rect x="150" y="116" width="135.9" height="15" fill="#c297ff" rx="3" opacity="0.9"/>
+<text x="292.9" y="128" fill="#e7eaf0" font-size="11">965 req/s</text><text x="140" y="154" fill="#e7eaf0" font-size="11.5" text-anchor="end">nb_curl</text><rect x="150" y="142" width="704" height="15" fill="#1c212b" rx="3"/>
+<rect x="150" y="142" width="294.4" height="15" fill="#ff9f43" rx="3" opacity="1"/>
+<text x="451.4" y="154" fill="#e7eaf0" font-size="11">2,091 req/s</text>
 </svg>

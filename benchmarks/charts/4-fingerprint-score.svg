@@ -2,11 +2,11 @@
 <rect x="-12" y="-12" width="944" height="154" fill="#0f1115" rx="10"/>
 <text x="140" y="25" fill="#e7eaf0" font-size="11.5" text-anchor="end">Chrome（基线）</text><rect x="150" y="12" width="704" height="17" fill="#1c212b" rx="3"/>
 <rect x="150" y="12" width="704.0" height="17" fill="#8b95a7" rx="3" opacity="0.9"/>
-<text x="861.0" y="25" fill="#e7eaf0" font-size="11">100 分</text><text x="140" y="53" fill="#e7eaf0" font-size="11.5" text-anchor="end">nb_curl · chrome150</text><rect x="150" y="40" width="704" height="17" fill="#1c212b" rx="3"/>
+<text x="861.0" y="25" fill="#e7eaf0" font-size="11">100 分</text><text x="140" y="53" fill="#e7eaf0" font-size="11.5" text-anchor="end">nb_curl</text><rect x="150" y="40" width="704" height="17" fill="#1c212b" rx="3"/>
 <rect x="150" y="40" width="668.8" height="17" fill="#ff9f43" rx="3" opacity="1"/>
-<text x="825.8" y="53" fill="#e7eaf0" font-size="11">95 分</text><text x="140" y="81" fill="#e7eaf0" font-size="11.5" text-anchor="end">curl_cffi · chrome150</text><rect x="150" y="68" width="704" height="17" fill="#1c212b" rx="3"/>
-<rect x="150" y="68" width="521.0" height="17" fill="#7ee787" rx="3" opacity="0.9"/>
-<text x="678.0" y="81" fill="#e7eaf0" font-size="11">74 分</text><text x="140" y="109" fill="#e7eaf0" font-size="11.5" text-anchor="end">requests_go · TLS_CHROME_LATEST</text><rect x="150" y="96" width="704" height="17" fill="#1c212b" rx="3"/>
-<rect x="150" y="96" width="387.2" height="17" fill="#c297ff" rx="3" opacity="0.9"/>
-<text x="544.2" y="109" fill="#e7eaf0" font-size="11">55 分</text>
+<text x="825.8" y="53" fill="#e7eaf0" font-size="11">95 分</text><text x="140" y="81" fill="#e7eaf0" font-size="11.5" text-anchor="end">requests_go</text><rect x="150" y="68" width="704" height="17" fill="#1c212b" rx="3"/>
+<rect x="150" y="68" width="633.6" height="17" fill="#c297ff" rx="3" opacity="0.9"/>
+<text x="790.6" y="81" fill="#e7eaf0" font-size="11">90 分</text><text x="140" y="109" fill="#e7eaf0" font-size="11.5" text-anchor="end">curl_cffi</text><rect x="150" y="96" width="704" height="17" fill="#1c212b" rx="3"/>
+<rect x="150" y="96" width="556.2" height="17" fill="#7ee787" rx="3" opacity="0.9"/>
+<text x="713.2" y="109" fill="#e7eaf0" font-size="11">79 分</text>
 </svg>

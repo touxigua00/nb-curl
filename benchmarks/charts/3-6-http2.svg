@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="-12 -12 944 146" width="944" height="146" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
 <rect x="-12" y="-12" width="944" height="146" fill="#0f1115" rx="10"/>
 <text x="140" y="24" fill="#e7eaf0" font-size="11.5" text-anchor="end">httpx[h2]</text><rect x="150" y="12" width="704" height="15" fill="#1c212b" rx="3"/>
-<rect x="150" y="12" width="258.3" height="15" fill="#f2cf66" rx="3" opacity="0.9"/>
-<text x="415.3" y="24" fill="#e7eaf0" font-size="11">734 req/s</text><text x="140" y="50" fill="#e7eaf0" font-size="11.5" text-anchor="end">curl_cffi</text><rect x="150" y="38" width="704" height="15" fill="#1c212b" rx="3"/>
-<rect x="150" y="38" width="453.0" height="15" fill="#7ee787" rx="3" opacity="0.9"/>
-<text x="610.0" y="50" fill="#e7eaf0" font-size="11">1,287 req/s</text><text x="140" y="76" fill="#e7eaf0" font-size="11.5" text-anchor="end">requests_go</text><rect x="150" y="64" width="704" height="15" fill="#1c212b" rx="3"/>
-<rect x="150" y="64" width="270.1" height="15" fill="#c297ff" rx="3" opacity="0.9"/>
-<text x="427.1" y="76" fill="#e7eaf0" font-size="11">767 req/s</text><text x="140" y="102" fill="#e7eaf0" font-size="11.5" text-anchor="end">nb_curl</text><rect x="150" y="90" width="704" height="15" fill="#1c212b" rx="3"/>
-<rect x="150" y="90" width="521.9" height="15" fill="#ff9f43" rx="3" opacity="1"/>
-<text x="678.9" y="102" fill="#e7eaf0" font-size="11">1,483 req/s</text>
+<rect x="150" y="12" width="336.5" height="15" fill="#f2cf66" rx="3" opacity="0.9"/>
+<text x="493.5" y="24" fill="#e7eaf0" font-size="11">956 req/s</text><text x="140" y="50" fill="#e7eaf0" font-size="11.5" text-anchor="end">curl_cffi</text><rect x="150" y="38" width="704" height="15" fill="#1c212b" rx="3"/>
+<rect x="150" y="38" width="538.9" height="15" fill="#7ee787" rx="3" opacity="0.9"/>
+<text x="695.9" y="50" fill="#e7eaf0" font-size="11">1,531 req/s</text><text x="140" y="76" fill="#e7eaf0" font-size="11.5" text-anchor="end">requests_go</text><rect x="150" y="64" width="704" height="15" fill="#1c212b" rx="3"/>
+<rect x="150" y="64" width="331.2" height="15" fill="#c297ff" rx="3" opacity="0.9"/>
+<text x="488.2" y="76" fill="#e7eaf0" font-size="11">941 req/s</text><text x="140" y="102" fill="#e7eaf0" font-size="11.5" text-anchor="end">nb_curl</text><rect x="150" y="90" width="704" height="15" fill="#1c212b" rx="3"/>
+<rect x="150" y="90" width="684.3" height="15" fill="#ff9f43" rx="3" opacity="1"/>
+<text x="841.3" y="102" fill="#e7eaf0" font-size="11">1,944 req/s</text>
 </svg>
