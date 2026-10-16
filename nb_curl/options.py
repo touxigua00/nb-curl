@@ -20,7 +20,7 @@
 示例：
 
     import nb_curl
-    s = nb_curl.Session(impersonate="chrome152")
+    s = nb_curl.Session(impersonate="chrome155")
     s.get(url, curl_options={
         nb_curl.CurlOpt.DOH_URL: "https://1.1.1.1/dns-query",
         nb_curl.CurlOpt.INTERFACE: "192.0.2.10",
@@ -31,20 +31,34 @@ from __future__ import annotations
 
 from ._curlopt_generated import CurlOpt, _VTYPE
 
-__all__ = ["CurlOpt", "apply_curl_options", "SAFE_OPTIONS", "DANGEROUS_OPTIONS"]
+__all__ = ["CurlOpt", "apply_curl_options", "SAFE_OPTIONS", "DANGEROUS_OPTIONS",
+           "CURLWS_TEXT", "CURLWS_BINARY", "CURLWS_CONT", "CURLWS_CLOSE",
+           "CURLWS_PING", "CURLWS_PONG", "CURLWS_OFFSET",
+           "CURLWS_RAW_MODE", "CURLWS_NOAUTOPONG",
+           "CURLE_AGAIN", "CURLE_GOT_NOTHING"]
 
-# 帧类型 flag（WebSocket 用，与 curl 的 CURLWS_* 一致）
+# 帧类型 flag（WebSocket 用，与 curl 的 CURLWS_* 一致；见 curl/websockets.h）
 CURLWS_TEXT = 1
 CURLWS_BINARY = 2
 CURLWS_CONT = 4
 CURLWS_CLOSE = 8
 CURLWS_PING = 0x10
-CURLWS_PONG = 0x20
+# recv meta 里的"这是帧内偏移片段"位（不是 PONG！）
+CURLWS_OFFSET = 0x20
+# 真正的 PONG 发送位（1<<6）。旧值 0x20 是 CURLWS_OFFSET，
+# 用它发 PONG 会被 curl 抹成 0 -> CURLE_BAD_FUNCTION_ARGUMENT(43)。
+CURLWS_PONG = 0x40
 
-# CURLE_AGAIN：ws_recv 无数据可读时返回
+# CURLOPT_WS_OPTIONS 的取值位（curl/websockets.h）
+CURLWS_RAW_MODE = 1
+# 关掉 libcurl 自动回 PONG；置上后必须由应用自己回 PONG。
+# 必须在 **握手前** 设：libcurl 的自动 PONG 在纯 curl_ws_recv 轮询下不会被 flush。
+CURLWS_NOAUTOPONG = 2
+
+# CURLE_AGAIN：ws_recv / ws_send 无数据可读（不可写）时返回
 CURLE_AGAIN = 81
-# 桥接层自定义：ws_send 部分发送
-_WS_PARTIAL = -3
+# CURLE_GOT_NOTHING：对端没发 CLOSE 就直接断开
+CURLE_GOT_NOTHING = 52
 # 桥接层自定义：option 编号不在该类型区间
 _BAD_OPTION_RANGE = -2
 

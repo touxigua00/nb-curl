@@ -19,7 +19,11 @@ import os
 
 from ._curlopt_generated import CurlOpt
 
-__all__ = ["CffiBackend", "NativeError", "cffi_available"]
+__all__ = ["CffiBackend", "NativeError", "cffi_available", "MULTI_ABI_VERSION"]
+
+#: 桥接层 multi ABI 版本（对应 native/nb_curl_bridge.h 的 nb_multi_abi_version()）。
+#: 版本不一致 = Python 与 DLL 不配套，**直接报错**，不静默降级。
+MULTI_ABI_VERSION = 3
 
 
 class NativeError(RuntimeError):
@@ -116,6 +120,20 @@ class CffiBackend:
             raise ImportError(
                 "nb_curl CFFI ABI 不匹配：C 端 nb_fingerprint=%d 字节，"
                 "CFFI 端=%d 字节。请重新安装与本机 Python 匹配的 nb-curl。" % (expect, actual))
+
+        # 阶段 2：multi ABI 必须存在且版本一致（不静默降级到旧 DLL）
+        ver = self._c.nb_multi_abi_version()
+        if ver != MULTI_ABI_VERSION:
+            raise ImportError(
+                "nb_curl native 库的 multi ABI 版本为 %r，期望 %d。"
+                "请用 build/ 下的新脚本重新构建 native/nb_curl_bridge.c。"
+                % (ver, MULTI_ABI_VERSION))
+        for struct_name, want in (("nb_sock_info", 16), ("nb_poll_item", 16)):
+            got = self._ffi.sizeof(struct_name)
+            if got != want:
+                raise ImportError(
+                    "nb_curl CFFI ABI 不匹配：%s=%d 字节，期望 %d 字节。"
+                    % (struct_name, got, want))
 
         self._c.nb_global_init()
 
@@ -223,8 +241,10 @@ class CffiBackend:
     def easy_set_proxy(self, handle, proxy) -> int:
         return self._c.easy_set_proxy(handle, proxy if proxy is not None else self._ffi.NULL)
 
-    def easy_set_userpwd(self, handle, userpwd: bytes) -> int:
-        return self._c.easy_set_userpwd(handle, userpwd)
+    def easy_set_userpwd(self, handle, userpwd) -> int:
+        # userpwd=None 是"显式取消认证"（句柄复用时否则会残留上一次的 auth）
+        return self._c.easy_set_userpwd(
+            handle, userpwd if userpwd is not None else self._ffi.NULL)
 
     def easy_set_redirect(self, handle, follow: int, max_redirs: int) -> int:
         return self._c.easy_set_redirect(handle, follow, max_redirs)
@@ -274,7 +294,14 @@ class CffiBackend:
     def install_stream_callbacks(self, handle, on_chunk, on_header):
         """把响应体/响应头的回调换成 Python 函数。
 
-        :param on_chunk: ``f(data: bytes) -> bool`` —— 收到一块响应体，返回 False 中止传输
+        :param on_chunk: ``f(data: bytes) -> bool | int``：
+
+            * ``True``  —— 这一块已被消费，回 ``size*nmemb``；
+            * ``False`` —— 写回调真失败（CURLE_WRITE_ERROR），回 0；
+            * 其它 ``int`` —— **原样**回给 libcurl，用于背压
+              （``CURL_WRITEFUNC_PAUSE`` = 0x10000001）以及前向兼容
+              ``CURL_WRITEFUNC_ERROR``。回 PAUSE 的前提是这一块**没有被入队**，
+              否则 libcurl 恢复后会重投递同一块，正文会重复。
         :param on_header: ``f(line: bytes) -> bool`` —— 收到一行响应头（状态行也算）
         :returns: 需要**保活到 perform 结束**的对象（CFFI 的闭包被 free 掉就会崩）
 
@@ -288,7 +315,12 @@ class CffiBackend:
             n = size * nmemb
             if not n:
                 return 0
-            return n if on_chunk(ffi.buffer(ptr, n)[:]) else 0
+            result = on_chunk(ffi.buffer(ptr, n)[:])
+            if result is True:
+                return n
+            if isinstance(result, int):
+                return result          # False -> 0；PAUSE/ERROR 等原样透传
+            return 0
 
         def _header(ptr, size, nmemb, _ud):
             n = size * nmemb
@@ -351,7 +383,10 @@ class CffiBackend:
         headers_len = ffi.new("size_t *")
         err = ffi.new("char **")
 
-        code = c.easy_perform(handle, status, body, body_len, headers, headers_len, err)
+        # easy_perform_take：正文缓冲**所有权移交**，C 层不再整块复制一份，
+        # Python 侧只做一次 ffi.buffer(...)[:]（旧路径是 C 复制 + Python 复制共两次）
+        code = c.easy_perform_take(handle, status, body, body_len,
+                                   headers, headers_len, err)
 
         body_ptr = body[0]
         head_ptr = headers[0]
@@ -405,6 +440,143 @@ class CffiBackend:
         if ptr == ffi.NULL:
             return None
         return ffi.string(ptr).decode("utf-8", "replace")
+
+    # -- multi / 结果移交 / poll（阶段 2 新增 ABI） ------------------------ #
+    def multi_abi_version(self) -> int:
+        return int(self._c.nb_multi_abi_version())
+
+    def multi_init(self):
+        return self._c.nb_multi_init()
+
+    def multi_cleanup(self, multi) -> None:
+        self._c.nb_multi_cleanup(multi)
+
+    def multi_add(self, multi, handle) -> int:
+        return int(self._c.nb_multi_add(multi, handle))
+
+    def multi_remove(self, multi, handle) -> int:
+        return int(self._c.nb_multi_remove(multi, handle))
+
+    def multi_active(self, multi) -> int:
+        return int(self._c.nb_multi_active(multi))
+
+    def multi_perform(self, multi) -> int:
+        return int(self._c.nb_multi_perform(multi))
+
+    def multi_socket_action(self, multi, fd: int, ev_bitmask: int) -> int:
+        return int(self._c.nb_multi_socket_action(multi, int(fd), int(ev_bitmask)))
+
+    def multi_socket_snapshot(self, multi) -> list:
+        """当前登记的 socket 表：``[(fd, action), ...]``（action 为 CURL_POLL_*）。"""
+        ffi = self._ffi
+        total = ffi.new("int *")
+        self._c.nb_multi_socket_snapshot(multi, ffi.NULL, 0, total)
+        n = int(total[0])
+        if n <= 0:
+            return []
+        arr = ffi.new("nb_sock_info[]", n)
+        got = int(self._c.nb_multi_socket_snapshot(multi, arr, n, total))
+        if got <= 0:
+            return []
+        return [(int(arr[i].fd), int(arr[i].action)) for i in range(got)]
+
+    def multi_socket_changes(self, multi) -> list:
+        """消费 socket 变更：``[(fd, action), ...]``，REMOVE 为 4。"""
+        ffi = self._ffi
+        total = ffi.new("int *")
+        rc = int(self._c.nb_multi_socket_changes(multi, ffi.NULL, 0, total))
+        if rc < 0:
+            raise NativeError(rc, "multi_socket_changes failed")
+        n = int(total[0])
+        if n == 0:
+            return []
+        arr = ffi.new("nb_sock_info[]", n)
+        got = int(self._c.nb_multi_socket_changes(multi, arr, n, total))
+        if got < 0:
+            raise NativeError(got, "multi_socket_changes failed")
+        return [(int(arr[i].fd), int(arr[i].action)) for i in range(got)]
+
+    def multi_timer(self, multi) -> int:
+        out = self._ffi.new("long *")
+        if self._c.nb_multi_timer(multi, out) != 0:
+            return -1
+        return int(out[0])
+
+    def multi_fire_timer(self, multi) -> int:
+        return int(self._c.nb_multi_fire_timer(multi))
+
+    def multi_poll(self, multi, timeout_ms: int) -> int:
+        out = self._ffi.new("int *")
+        return int(self._c.nb_multi_poll(multi, int(timeout_ms), out))
+
+    def multi_wakeup(self, multi) -> int:
+        return int(self._c.nb_multi_wakeup(multi))
+
+    def multi_drain(self, multi):
+        """取一条完成消息：``(msg, code, easy)``；队列空返回 ``None``。"""
+        ffi = self._ffi
+        msg = ffi.new("int *")
+        code = ffi.new("int *")
+        easy = ffi.new("void **")
+        if self._c.nb_multi_drain(multi, msg, code, easy) != 1:
+            return None
+        return int(msg[0]), int(code[0]), easy[0]
+
+    def prepare_request(self, handle) -> int:
+        return int(self._c.easy_prepare_request(handle))
+
+    def take_body(self, handle) -> bytes:
+        return self._take(handle, self._c.easy_take_body)
+
+    def take_headers(self, handle) -> bytes:
+        return self._take(handle, self._c.easy_take_headers)
+
+    def _take(self, handle, func) -> bytes:
+        """所有权移交式取结果：读一次就 free，不做二次 C 复制。"""
+        ffi = self._ffi
+        out = ffi.new("char **")
+        length = ffi.new("size_t *")
+        if func(handle, out, length) != 0:
+            return b""
+        ptr = out[0]
+        if ptr == ffi.NULL:
+            return b""
+        n = int(length[0])
+        data = ffi.buffer(ptr, n)[:] if n else b""
+        self._c.easy_free_string(ptr)     # 转成 bytes 后立刻 free
+        return data
+
+    def pause(self, handle, bitmask: int) -> int:
+        return int(self._c.easy_pause(handle, int(bitmask)))
+
+    def poll_sockets(self, items, timeout_ms: int) -> list:
+        """跨平台 poll：``items`` 是 ``[(fd, events)]``，返回 ``[(fd, revents)]``。
+
+        - 无就绪条目（含等待超时、被信号打断）返回 ``[]``；
+        - 真正的失败（参数错 / 系统调用错）**抛 :class:`NativeError`**，绝不
+          伪装成"没有事件" —— 上层驱动必须能区分"没事件"和"poll 坏了"。
+        """
+        ffi = self._ffi
+        if not items:
+            return []
+        arr = ffi.new("nb_poll_item[]", len(items))
+        for i, (fd, events) in enumerate(items):
+            arr[i].fd = int(fd)
+            arr[i].events = int(events)
+            arr[i].revents = 0
+        ready = int(self._c.nb_poll_sockets(arr, len(items), int(timeout_ms)))
+        if ready == -3:                   # EINTR：不是错误，按"没有事件"重试
+            return []
+        if ready < 0:
+            raise NativeError(ready, "nb_poll_sockets 调用失败")
+        if ready == 0:
+            return []
+        out = []
+        for i in range(len(items)):
+            revents = int(arr[i].revents)
+            if revents:
+                out.append((int(arr[i].fd), revents))
+        return out
 
     # -- 杂项 -------------------------------------------------------------- #
     def strerror(self, code: int) -> str:

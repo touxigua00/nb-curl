@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json as _json
 import re
+import threading
 from datetime import timedelta
 from typing import Any, Iterable, Iterator, Mapping
 
@@ -174,6 +175,10 @@ class CookieJar(dict):
 
     def __init__(self, items: Mapping[str, Any] | None = None):
         super().__init__()
+        # 复合操作锁：_absorb/_wanted/_prune 是"读-改-写"的复合操作，并发请求
+        # （cookies.concurrent 回归）同时吸收各自引擎导出会互相踩 —— 每一步都
+        # 必须整体持锁，而不是只锁单条 dict 赋值。
+        self._lock = threading.Lock()
         self._lines: dict[tuple[str, str, bool, str], str] = {}
         self._explicit: dict[str, str] = {}
         for name, value in dict(items or {}).items():
@@ -206,15 +211,17 @@ class CookieJar(dict):
         return value
 
     def clear(self) -> None:
-        self._explicit.clear()
-        self._lines.clear()
-        dict.clear(self)
+        with self._lock:
+            self._explicit.clear()
+            self._lines.clear()
+            dict.clear(self)
 
     def _forget(self, name: str) -> None:
         """用户删掉一个 cookie：显式记录 + 所有作用域下的同名行全部作废。"""
-        self._explicit.pop(name, None)
-        for key in [k for k in self._lines if k[0] == name]:
-            del self._lines[key]
+        with self._lock:
+            self._explicit.pop(name, None)
+            for key in [k for k in self._lines if k[0] == name]:
+                del self._lines[key]
 
     # -- 引擎侧（只在 session 内部用） ------------------------------------ #
     def _absorb(self, dump: str, now: float,
@@ -223,44 +230,51 @@ class CookieJar(dict):
 
         ``skip`` 是本次请求专用的作用域键（显式 ``Cookie`` 头转来的，用完即弃），
         不能被记进会话罐。
+
+        过期键删除是**幂等 pop**：并发请求可能已经先吸收了同一条过期通知，
+        ``del`` 会 KeyError（cookies 回归双后端复现的 2 断言失败），``pop`` 不会。
         """
-        for line in dump.splitlines():
-            parsed = parse_cookie_line(line)
-            if parsed is None or parsed[0] in skip:
-                continue
-            key, value, expires_at = parsed
-            name = key[0]
-            if expires_at and expires_at <= now:
-                # 引擎里已经过期删掉了，表面视图也别再留着
-                del self._lines[key]
-                if not any(k[0] == name for k in self._lines):
+        with self._lock:
+            for line in dump.splitlines():
+                parsed = parse_cookie_line(line)
+                if parsed is None or parsed[0] in skip:
+                    continue
+                key, value, expires_at = parsed
+                name = key[0]
+                if expires_at and expires_at <= now:
+                    # 引擎里已经过期删掉了，表面视图也别再留着（幂等：可能已被
+                    # 并发请求吸收同一条过期通知时删掉）
+                    self._lines.pop(key, None)
+                    if not any(k[0] == name for k in self._lines):
+                        self._explicit.pop(name, None)
+                        dict.pop(self, name, None)
+                    continue
+                self._lines[key] = line
+                if self._explicit.get(name) not in (None, value):
+                    # 服务端改了同名 cookie：引擎里的值才是权威，别再用我们那份覆盖它
                     self._explicit.pop(name, None)
-                    dict.pop(self, name, None)
-                continue
-            self._lines[key] = line
-            if self._explicit.get(name) not in (None, value):
-                # 服务端改了同名 cookie：引擎里的值才是权威，别再用我们那份覆盖它
-                del self._explicit[name]
-            dict.__setitem__(self, name, value)
+                dict.__setitem__(self, name, value)
 
     def _wanted(self, host: str, now: float) -> dict[tuple[str, str, bool, str], str]:
         """本次请求在 ``host`` 上应该生效的全部 cookie 行（作用域键 -> 行）。"""
         self._prune(now)
-        wanted = dict(self._lines)
-        for name, value in self._explicit.items():
-            key = (name, host, False, "/")
-            if key not in wanted:      # 引擎里已有该主机下的同名 cookie，就别造第二份
-                wanted[key] = _netscape_cookie_line(host, False, "/", name, value)
+        with self._lock:
+            wanted = dict(self._lines)
+            for name, value in self._explicit.items():
+                key = (name, host, False, "/")
+                if key not in wanted:      # 引擎里已有该主机下的同名 cookie，就别造第二份
+                    wanted[key] = _netscape_cookie_line(host, False, "/", name, value)
         return wanted
 
     def _prune(self, now: float) -> None:
         """丢弃已经过期的行（比如从文件读进来的、带过期时间的 cookie）。"""
-        for key, line in list(self._lines.items()):
-            parsed = parse_cookie_line(line)
-            if parsed and parsed[2] and parsed[2] <= now:
-                del self._lines[key]
-                if not any(k[0] == key[0] for k in self._lines):
-                    dict.pop(self, key[0], None)
+        with self._lock:
+            for key, line in list(self._lines.items()):
+                parsed = parse_cookie_line(line)
+                if parsed and parsed[2] and parsed[2] <= now:
+                    self._lines.pop(key, None)
+                    if not any(k[0] == key[0] for k in self._lines):
+                        dict.pop(self, key[0], None)
 
     def __repr__(self) -> str:
         return "CookieJar(%r)" % (dict(self),)
@@ -471,9 +485,11 @@ class Response:
             yield content[i:i + chunk_size]
 
     async def aiter_content(self, chunk_size: int = 8192) -> Any:
-        """``iter_content`` 的异步版本：每块都丢进线程池取，不卡事件循环。
+        """``iter_content`` 的异步版本：真·异步增量读取，**不**每块丢线程池。
 
-        只在异步里用得上 —— 同步场景直接用 ``iter_content()`` 更省开销。
+        流式响应走 :meth:`_StreamBody.aiter_chunks`：每挂起一次只建一个 Future
+        （由 reactor 线程经 ``call_soon_threadsafe`` 唤醒），不再每块一次
+        ``asyncio.to_thread``。非流式响应在线程池里整体切片（内容已在内存）。
         """
         import asyncio
 
@@ -482,13 +498,13 @@ class Response:
             for part in self.iter_content(chunk_size):
                 yield part
             return
-        iterator = stream.iter_chunks(chunk_size)
-        sentinel = object()
-        while True:
-            part = await asyncio.to_thread(_next_or, iterator, sentinel)
-            if part is sentinel:
-                return
-            yield part
+        if self._content is None:
+            async for part in stream.aiter_chunks(chunk_size):
+                yield part
+            return
+        content = self.content
+        for i in range(0, len(content), chunk_size):
+            yield content[i:i + chunk_size]
 
     def iter_lines(self, chunk_size: int = 8192, delimiter: bytes | None = None) -> Iterator[bytes]:
         delim = delimiter or b"\n"
@@ -545,5 +561,5 @@ class Response:
 
 
 def _next_or(iterator: Any, sentinel: Any) -> Any:
-    """``next(iterator, sentinel)`` —— 供 ``asyncio.to_thread`` 调用。"""
+    """``next(iterator, sentinel)`` —— 兼容保留（不再被 aiter_content 使用）。"""
     return next(iterator, sentinel)

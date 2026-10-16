@@ -90,20 +90,21 @@ class SessionShortcuts:
 # 异步（同一套转发，只是丢进线程池跑）
 # --------------------------------------------------------------------------- #
 class AsyncSessionShortcuts:
-    """``AsyncSession`` 的 8 个异步入口，参数与同步版一致。"""
+    """``AsyncSession`` 的 8 个异步入口，参数与同步版一致。
+
+    实现都在 :meth:`nb_curl.aio.AsyncSession._request_async`：非流式走 libcurl
+    multi 驱动（不再每请求一个线程），流式走兼容的独立线程路径。这一层只负责
+    摆签名，不做任何请求装配。
+    """
 
     if TYPE_CHECKING:
-        _executor: Any
-
-        def _request(self, method: str, url: str,
-                     **options: Unpack[RequestOptions]) -> Response: ...
+        async def _request_async(self, method: str, url: str,
+                                 **options: Unpack[RequestOptions]) -> Response: ...
 
     async def request(self, method: str, url: str,
                       **options: Unpack[RequestOptions]) -> Response:
         """任意方法（异步）。参数见 :class:`nb_curl.params.RequestOptions`。"""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._executor, lambda: self._request(method, url, **options))
+        return await self._request_async(method, url, **options)
 
     async def get(self, url: str, **options: Unpack[RequestOptions]) -> Response:
         """GET 请求（异步）。参数见 :class:`nb_curl.params.RequestOptions`。"""

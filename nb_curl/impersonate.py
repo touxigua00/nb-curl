@@ -38,7 +38,7 @@ BUILTIN_TARGETS: tuple[str, ...] = (
     "chrome100", "chrome101", "chrome104", "chrome107", "chrome110",
     "chrome116", "chrome119", "chrome120", "chrome123", "chrome124",
     "chrome131", "chrome131_android", "chrome133a", "chrome136",
-    "chrome142", "chrome145", "chrome146", "chrome150", "chrome152",
+    "chrome142", "chrome145", "chrome146", "chrome150", "chrome155",
     "edge99", "edge101",
     "firefox133", "firefox135", "firefox144", "firefox147",
     "okhttp4_android",
@@ -55,7 +55,7 @@ ImpersonateTarget = Literal[
     "chrome100", "chrome101", "chrome104", "chrome107", "chrome110",
     "chrome116", "chrome119", "chrome120", "chrome123", "chrome124",
     "chrome131", "chrome131_android", "chrome133a", "chrome136",
-    "chrome142", "chrome145", "chrome146", "chrome150", "chrome152",
+    "chrome142", "chrome145", "chrome146", "chrome150", "chrome155",
     "edge99", "edge101",
     "firefox133", "firefox135", "firefox144", "firefox147",
     "okhttp4_android",
@@ -67,8 +67,8 @@ ImpersonateTarget = Literal[
 
 # 家族名 -> 最新版本
 FAMILY_LATEST = {
-    "chrome": "chrome152",
-    "chromium": "chrome152",
+    "chrome": "chrome155",
+    "chromium": "chrome155",
     "edge": "edge101",
     "firefox": "firefox147",
     "okhttp": "okhttp4_android",
@@ -83,7 +83,7 @@ RECOMMENDED_TARGETS: tuple[str, ...] = (
     "chrome131",
     "chrome146",
     "chrome150",
-    "chrome152",
+    "chrome155",
     "firefox147",
 )
 

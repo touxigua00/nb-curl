@@ -14,7 +14,10 @@ import os
 
 from ._curlopt_generated import CurlOpt
 
-__all__ = ["CtypesBackend", "NativeError"]
+__all__ = ["CtypesBackend", "NativeError", "MULTI_ABI_VERSION"]
+
+#: 与 nb_curl_bridge.h 的 nb_multi_abi_version() 对应；不一致直接报错
+MULTI_ABI_VERSION = 3
 
 _IS_WIN = os.name == "nt"
 _LIB_FILENAME = "nb_curl_native.dll" if _IS_WIN else "libnb_curl_native.so"
@@ -135,6 +138,26 @@ _TCP_SHAPE_FIELDS = ("ttl", "mss", "window", "wscale", "rcvbuf", "timestamp")
 _TCP_ACTUAL_FIELDS = ("ttl", "mss", "wscale", "window", "rcvbuf", "timestamp")
 
 
+class _NbSockInfo(ctypes.Structure):
+    """与 C 端 nb_sock_info 逐字段一致（fd 为 64 位）。"""
+
+    _fields_ = [
+        ("fd", ctypes.c_longlong),
+        ("action", ctypes.c_int),
+        ("_reserved", ctypes.c_int),
+    ]
+
+
+class _NbPollItem(ctypes.Structure):
+    """与 C 端 nb_poll_item 逐字段一致。"""
+
+    _fields_ = [
+        ("fd", ctypes.c_longlong),
+        ("events", ctypes.c_int),
+        ("revents", ctypes.c_int),
+    ]
+
+
 class CtypesBackend:
     """用 ctypes 直接驱动 nb_curl_native.dll。"""
 
@@ -211,12 +234,12 @@ class CtypesBackend:
             "easy_ws_send", c_int, [c_void_p, c_char_p, c_int, c_int])
         self._easy_ws_recv = sig(
             "easy_ws_recv", c_int,
-            [c_void_p, ctypes.c_char, c_int,
+            [c_void_p, ctypes.POINTER(ctypes.c_char), c_int,
              ctypes.POINTER(c_int), ctypes.POINTER(c_int),
              ctypes.POINTER(ctypes.c_longlong), ctypes.POINTER(ctypes.c_longlong)])
 
         self._easy_perform = sig(
-            "easy_perform", c_int,
+            "easy_perform_take", c_int,
             [c_void_p, ctypes.POINTER(c_int),
              ctypes.POINTER(c_char_p), ctypes.POINTER(ctypes.c_size_t),
              ctypes.POINTER(c_char_p), ctypes.POINTER(ctypes.c_size_t),
@@ -233,6 +256,44 @@ class CtypesBackend:
         self._easy_version = sig("easy_version", c_char_p, [])
         self._easy_strerror = sig("easy_strerror", c_char_p, [c_int])
 
+        # 阶段 2：multi / 结果移交 / poll（内部名一律 _m_*，包装方法在下面）
+        self._m_abi = sig("nb_multi_abi_version", c_int, [])
+        self._m_init = sig("nb_multi_init", c_void_p, [])
+        self._m_cleanup = sig("nb_multi_cleanup", None, [c_void_p])
+        self._m_add = sig("nb_multi_add", c_int, [c_void_p, c_void_p])
+        self._m_remove = sig("nb_multi_remove", c_int, [c_void_p, c_void_p])
+        self._m_active = sig("nb_multi_active", c_int, [c_void_p])
+        self._m_perform = sig("nb_multi_perform", c_int, [c_void_p])
+        self._m_socket_action = sig(
+            "nb_multi_socket_action", c_int, [c_void_p, ctypes.c_longlong, c_int])
+        self._m_snapshot = sig(
+            "nb_multi_socket_snapshot", c_int,
+            [c_void_p, ctypes.POINTER(_NbSockInfo), c_int, ctypes.POINTER(c_int)])
+        self._m_socket_changes = sig(
+            "nb_multi_socket_changes", c_int,
+            [c_void_p, ctypes.POINTER(_NbSockInfo), c_int, ctypes.POINTER(c_int)])
+        self._m_timer = sig(
+            "nb_multi_timer", c_int, [c_void_p, ctypes.POINTER(c_long)])
+        self._m_fire_timer = sig("nb_multi_fire_timer", c_int, [c_void_p])
+        self._m_poll = sig(
+            "nb_multi_poll", c_int, [c_void_p, c_long, ctypes.POINTER(c_int)])
+        self._m_wakeup = sig("nb_multi_wakeup", c_int, [c_void_p])
+        self._m_drain = sig(
+            "nb_multi_drain", c_int,
+            [c_void_p, ctypes.POINTER(c_int), ctypes.POINTER(c_int),
+             ctypes.POINTER(c_void_p)])
+        self._easy_prepare_request = sig("easy_prepare_request", c_int, [c_void_p])
+        self._easy_take_body = sig(
+            "easy_take_body", c_int,
+            [c_void_p, ctypes.POINTER(c_void_p), ctypes.POINTER(ctypes.c_size_t)])
+        self._easy_take_headers = sig(
+            "easy_take_headers", c_int,
+            [c_void_p, ctypes.POINTER(c_void_p), ctypes.POINTER(ctypes.c_size_t)])
+        self._easy_pause = sig("easy_pause", c_int, [c_void_p, c_int])
+        self._poll_sockets_raw = sig(
+            "nb_poll_sockets", c_int,
+            [ctypes.POINTER(_NbPollItem), c_int, c_long])
+
         # 初始化前先校验 ABI 布局，避免结构体错位导致的静默错误
         expect = self.nb_fingerprint_size()
         actual = ctypes.sizeof(_NbFingerprint)
@@ -240,6 +301,20 @@ class CtypesBackend:
             raise ImportError(
                 "nb_curl native ABI 不匹配：C 端 nb_fingerprint=%d 字节，"
                 "Python 端=%d 字节。请重新安装与本机平台匹配的 nb-curl。" % (expect, actual))
+
+        # 阶段 2：multi ABI 必须存在且版本一致（不静默降级到旧 DLL）
+        ver = self._m_abi()
+        if ver != MULTI_ABI_VERSION:
+            raise ImportError(
+                "nb_curl native 库的 multi ABI 版本为 %r，期望 %d。"
+                "请用 build/ 下的新脚本重新构建 native/nb_curl_bridge.c。"
+                % (ver, MULTI_ABI_VERSION))
+        for cls, want in ((_NbSockInfo, 16), (_NbPollItem, 16)):
+            got = ctypes.sizeof(cls)
+            if got != want:
+                raise ImportError(
+                    "nb_curl native ABI 不匹配：%s=%d 字节，期望 %d 字节。"
+                    % (cls.__name__, got, want))
 
         self.nb_global_init()
 
@@ -378,6 +453,134 @@ class CtypesBackend:
             return None
         return out.value.decode("utf-8", "replace") if out.value else None
 
+    # -- multi / 结果移交 / poll（阶段 2 新增 ABI） ------------------------ #
+    def multi_abi_version(self) -> int:
+        return int(self._m_abi())
+
+    def multi_init(self):
+        return self._m_init()
+
+    def multi_cleanup(self, multi) -> None:
+        self._m_cleanup(multi)
+
+    def multi_add(self, multi, handle) -> int:
+        return int(self._m_add(multi, handle))
+
+    def multi_remove(self, multi, handle) -> int:
+        return int(self._m_remove(multi, handle))
+
+    def multi_active(self, multi) -> int:
+        return int(self._m_active(multi))
+
+    def multi_perform(self, multi) -> int:
+        return int(self._m_perform(multi))
+
+    def multi_socket_action(self, multi, fd: int, ev_bitmask: int) -> int:
+        return int(self._m_socket_action(multi, int(fd), int(ev_bitmask)))
+
+    def multi_socket_snapshot(self, multi) -> list:
+        """当前登记的 socket 表：``[(fd, action), ...]``（action 为 CURL_POLL_*）。"""
+        total = ctypes.c_int(0)
+        self._m_snapshot(multi, None, 0, ctypes.byref(total))
+        n = int(total.value)
+        if n <= 0:
+            return []
+        arr = (_NbSockInfo * n)()
+        got = int(self._m_snapshot(multi, arr, n, ctypes.byref(total)))
+        if got <= 0:
+            return []
+        return [(int(arr[i].fd), int(arr[i].action)) for i in range(min(got, n))]
+
+    def multi_socket_changes(self, multi) -> list:
+        """消费 socket 变更：``[(fd, action), ...]``，REMOVE 为 4。"""
+        total = ctypes.c_int(0)
+        rc = int(self._m_socket_changes(multi, None, 0, ctypes.byref(total)))
+        if rc < 0:
+            raise NativeError(rc, "multi_socket_changes failed")
+        n = int(total.value)
+        if n == 0:
+            return []
+        arr = (_NbSockInfo * n)()
+        got = int(self._m_socket_changes(multi, arr, n, ctypes.byref(total)))
+        if got < 0:
+            raise NativeError(got, "multi_socket_changes failed")
+        return [(int(arr[i].fd), int(arr[i].action)) for i in range(got)]
+
+    def multi_timer(self, multi) -> int:
+        out = ctypes.c_long(-1)
+        if self._m_timer(multi, ctypes.byref(out)) != 0:
+            return -1
+        return int(out.value)
+
+    def multi_fire_timer(self, multi) -> int:
+        return int(self._m_fire_timer(multi))
+
+    def multi_poll(self, multi, timeout_ms: int) -> int:
+        out = ctypes.c_int(0)
+        return int(self._m_poll(multi, int(timeout_ms), ctypes.byref(out)))
+
+    def multi_wakeup(self, multi) -> int:
+        return int(self._m_wakeup(multi))
+
+    def multi_drain(self, multi):
+        """取一条完成消息：``(msg, code, easy)``；队列空返回 ``None``。"""
+        msg = ctypes.c_int(0)
+        code = ctypes.c_int(0)
+        easy = ctypes.c_void_p(None)
+        if self._m_drain(multi, ctypes.byref(msg), ctypes.byref(code),
+                         ctypes.byref(easy)) != 1:
+            return None
+        return int(msg.value), int(code.value), easy.value
+
+    def prepare_request(self, handle) -> int:
+        return int(self._easy_prepare_request(handle))
+
+    def take_body(self, handle) -> bytes:
+        return self._take_via(handle, self._easy_take_body)
+
+    def take_headers(self, handle) -> bytes:
+        return self._take_via(handle, self._easy_take_headers)
+
+    def _take_via(self, handle, func) -> bytes:
+        """所有权移交式取结果：读一次就 free，不做二次 C 复制。"""
+        out = ctypes.c_void_p(None)
+        length = ctypes.c_size_t(0)
+        if func(handle, ctypes.byref(out), ctypes.byref(length)) != 0:
+            return b""
+        if not out.value:
+            return b""
+        n = int(length.value)
+        data = ctypes.string_at(out.value, n) if n else b""
+        self._easy_free_string(out)       # 转成 bytes 后立刻 free
+        return data
+
+    def pause(self, handle, bitmask: int) -> int:
+        return int(self._easy_pause(handle, int(bitmask)))
+
+    def poll_sockets(self, items, timeout_ms: int) -> list:
+        """跨平台 poll：``items`` 是 ``[(fd, events)]``，返回 ``[(fd, revents)]``。
+
+        - 无就绪条目（含等待超时、被信号打断）返回 ``[]``；
+        - 真正的失败（参数错 / 系统调用错）**抛 :class:`NativeError`**，绝不
+          伪装成"没有事件" —— 上层驱动必须能区分"没事件"和"poll 坏了"。
+        """
+        if not items:
+            return []
+        arr = (_NbPollItem * len(items))()
+        for i, (fd, events) in enumerate(items):
+            arr[i].fd = int(fd)
+            arr[i].events = int(events)
+            arr[i].revents = 0
+        ready = int(self._poll_sockets_raw(arr, len(items), int(timeout_ms)))
+        if ready == -3:                   # EINTR：不是错误，按"没有事件"重试
+            return []
+        if ready < 0:
+            raise NativeError(ready, "nb_poll_sockets 调用失败")
+        if ready == 0:
+            return []
+        return [(int(arr[i].fd), int(arr[i].revents))
+                for i in range(len(items)) if arr[i].revents]
+
     # -- 杂项 -------------------------------------------------------------- #
     def strerror(self, code: int) -> str:
         msg = self._easy_strerror(code)
@@ -395,7 +598,14 @@ class CtypesBackend:
     def install_stream_callbacks(self, handle, on_chunk, on_header):
         """把响应体/响应头的回调换成 Python 函数（与 CFFI 后端同一套语义）。
 
-        :param on_chunk: ``f(data: bytes) -> bool``，返回 False 中止传输
+        :param on_chunk: ``f(data: bytes) -> bool | int``：
+
+            * ``True``  —— 这一块已被消费，回 ``size*nmemb``；
+            * ``False`` —— 写回调真失败（CURLE_WRITE_ERROR），回 0；
+            * 其它 ``int`` —— **原样**回给 libcurl，用于背压
+              （``CURL_WRITEFUNC_PAUSE`` = 0x10000001）以及前向兼容
+              ``CURL_WRITEFUNC_ERROR``。回 PAUSE 的前提是这一块**没有被入队**，
+              否则 libcurl 恢复后会重投递同一块，正文会重复。
         :param on_header: ``f(line: bytes) -> bool``
         :returns: 需要**保活到 perform 结束**的对象
         """
@@ -405,7 +615,12 @@ class CtypesBackend:
             if not n:
                 return 0
             # 用 string_at 而不是 c_char_p：响应体可能是二进制，含 \0 不能被截断
-            return n if on_chunk(ctypes.string_at(ptr, n)) else 0
+            result = on_chunk(ctypes.string_at(ptr, n))
+            if result is True:
+                return n
+            if isinstance(result, int):
+                return result          # False -> 0；PAUSE/ERROR 等原样透传
+            return 0
 
         def _header(ptr, size, nmemb, _ud):
             n = size * nmemb

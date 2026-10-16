@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field, fields
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .const import (
     CURL_SSLVERSION_MAX_DEFAULT,
@@ -121,8 +121,10 @@ DIY_FP_SPEC: dict[str, tuple[str, str]] = {
     "tls_trust_anchors": (
         "str（逗号分隔）",
         "trust_anchors(51764) 扩展要携带的信任锚 OID 列表（十进制点分，如 "
-        "'52580.200109.1.10'）；空串 '' 表示发送空列表。列表顺序在单次进程内"
-        "固定、进程之间随机，与真实 Chrome 一致"),
+        "'52580.200109.1.10'）；空串 '' 表示发送空列表。与 tls_signature_algorithms "
+        "一样是逐字段覆盖：给了就以它为准，连内置预设的那份也能整份换掉。列表按"
+        "你给的顺序原样发出，不做任何重排（内置 chrome155 用的就是真 Chrome 155 "
+        "的顺序）"),
     "tls_record_size_limit": (
         "int (1-65535)",
         "record_size_limit 扩展的值"),
@@ -158,9 +160,10 @@ DIY_FP_SPEC: dict[str, tuple[str, str]] = {
         "默认跟随 impersonate 预设（Chrome 开、Safari 关），"
         "与 http2_no_priority=True 互斥。权重用 http2_stream_weight 改"),
     "header_order": (
-        "str",
-        "普通请求头的发送顺序（逗号分隔的头名，大小写不敏感）。列出的头按序排到最前，"
-        "未列出的保持原相对顺序追加在后；HTTP/1.1 与 HTTP/2 都生效"),
+        "str 或 list[str]（'a,b' 与 ['a','b'] 等价）",
+        "普通请求头的发送顺序（头名，大小写不敏感）。列出的头按你给的顺序排到最前，"
+        "未列出的保持原相对顺序追加在后；HTTP/1.1 与 HTTP/2 都生效。"
+        "**host 永远排在最前**：名单里没写会自动补在最前，写在别处会被提上来，重复项只留一份"),
     "split_cookies": (
         "bool",
         "是否按浏览器风格把 Cookie 头拆成多行发送"),
@@ -238,6 +241,46 @@ def _normalize_sigalgs(value: Any, param: str) -> tuple[str, bool]:
     return ":".join(real), grease
 
 
+def _normalize_header_order(value: Any, param: str = "header_order") -> str:
+    """普通请求头顺序：接受 ``"a,b"`` 字符串或 ``["a", "b"]`` 列表。
+
+    统一成 C 层要的逗号分隔串（``CURLOPT_HTTPHEADER_ORDER`` 就是"名单里的头
+    按序排到最前，其余保持原相对顺序追加在后"）。
+
+    两条硬规则：
+
+    * **host 永远排在最前**：名单里没写就补在最前，写在别处会被提上来
+      —— 否则 host 会掉到"其余"那一组（真实浏览器与 curl 默认都是 Host 在第一位）；
+    * 同名（大小写不敏感）只保留第一次出现的那份，避免 C 层判成重复名单而报错。
+    """
+    if isinstance(value, str):
+        names = [p for p in value.replace(";", ",").split(",")]
+    elif isinstance(value, (list, tuple)):
+        names = [str(v) for v in value]
+    else:
+        raise FingerprintError(
+            "%s 必须是列表或逗号分隔的字符串，收到 %r" % (param, value))
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        token = name.strip()
+        if not token or token.lower() in seen:
+            continue
+        seen.add(token.lower())
+        out.append(token)
+    if not out:
+        raise FingerprintError("%s 不能为空" % param)
+    lowered = [n.lower() for n in out]
+    if "host" in lowered:
+        idx = lowered.index("host")
+        if idx:
+            out.insert(0, out.pop(idx))
+    else:
+        out.insert(0, "host")
+    return ",".join(out)
+
+
 def _validate_http2_settings(settings: str, param: str = "akamai/SETTINGS") -> None:
     """校验 "1:65536;2:0;4:6291456" 格式的 HTTP/2 SETTINGS。"""
     for pair in settings.split(";"):
@@ -299,7 +342,7 @@ class FingerprintOverrides:
     http2_no_priority: bool | None = None
     stream_weight: int | None = None
     stream_exclusive: int | None = None
-    header_order: str | None = None
+    header_order: str | Sequence[str] | None = None
     split_cookies: bool | None = None
     # H2 HEADERS 帧里是否带已废弃的 RFC 7540 优先级字段（Chrome flags=0x25）
     http2_headers_priority: bool | None = None
@@ -345,6 +388,9 @@ class FingerprintOverrides:
             validate_extension_ids(_split_ints(self.extension_order, "extension_order"))
         if self.cert_compression is not None:
             validate_cert_compression(self.cert_compression)
+        if self.header_order is not None:
+            # 字符串 / 列表两种写法都合法；这里只做一次归一化与早失败
+            _normalize_header_order(self.header_order)
         if self.delegated_credentials is not None:
             validate_sigalg_names(split_list(self.delegated_credentials, ":,"),
                                   param="delegated_credentials")
@@ -400,6 +446,10 @@ class FingerprintOverrides:
         if tls13:
             ciphers = values.get("ciphers")
             values["ciphers"] = "%s:%s" % (tls13, ciphers) if ciphers else tls13
+        # header_order 两种写法都收（字符串 / 列表），并在这里统一成 C 层的逗号串、
+        # 顺带把 host 提到最前 —— 直接构造 FingerprintOverrides 也走同一条路。
+        if values.get("header_order") is not None:
+            values["header_order"] = _normalize_header_order(values["header_order"])
         # Python 字段名 grease_sigalgs -> C 结构体字段名 tls_grease_sigalgs
         grease = values.pop("grease_sigalgs", None)
         if grease is not None:
@@ -667,7 +717,7 @@ def parse_diy_fp(diy_fp: Mapping[str, Any] | None) -> FingerprintOverrides:
         ov.http2_no_priority = bool(diy_fp["http2_no_priority"])
 
     if diy_fp.get("header_order") is not None:
-        ov.header_order = str(diy_fp["header_order"])
+        ov.header_order = _normalize_header_order(diy_fp["header_order"])
     if diy_fp.get("split_cookies") is not None:
         ov.split_cookies = bool(diy_fp["split_cookies"])
 
@@ -697,7 +747,7 @@ def build_overrides(
 class Fingerprint:
     """一份完整指纹描述：可只含 impersonate，也可完全自定义。
 
-    * ``impersonate``：内置预设名（C 内核 40 个，含 ``chrome152``，
+    * ``impersonate``：内置预设名（C 内核 40 个，含 ``chrome155``，
       见 :data:`nb_curl.impersonate.ImpersonateTarget`）；
     * ``ja3`` / ``akamai`` / ``diy_fp``：自定义指纹三件套，解析后汇入
       ``overrides``；

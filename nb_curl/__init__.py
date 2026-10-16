@@ -1,12 +1,12 @@
 """nb_curl —— 自带浏览器 TLS 指纹的 HTTP 客户端
 
     >>> import nb_curl
-    >>> r = nb_curl.get("https://example.com", impersonate="chrome152")
+    >>> r = nb_curl.get("https://example.com", impersonate="chrome155")
     >>> r.status_code
     200
     >>> r.text[:20]
 
-内置指纹（chrome99/116/131/146/150/152、firefox147 等 40 个预设）在 libcurl
+内置指纹（chrome99/116/131/146/150/155、firefox147 等 40 个预设）在 libcurl
 内核原生支持；自定义指纹通过 ``ja3`` / ``akamai`` / ``diy_fp`` /
 ``fp_file``（xcctls.top/all 快照）在 Python 侧下发，无需重编译。
 自定义参数的合法取值范围用 ``nb_curl.tls`` 自省（如 ``nb_curl.tls.supported_ciphers()``），
@@ -63,7 +63,7 @@ from . import tcp as tcp
 from . import tls as tls
 from .tcp import set_tcp_warnings, tcp_support
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 
 def backend_name() -> str:

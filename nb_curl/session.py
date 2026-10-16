@@ -13,8 +13,10 @@
   Python 侧只管把"该有哪些 cookie"同步进引擎（``CURLOPT_COOKIELIST``）。两条路
   并存会让同一个 cookie 被拼两遍（``Cookie: sid=x; sid=x``），所以本模块**绝不**
   设置 ``CURLOPT_COOKIE``。
-* **stream=True 是真流式**：请求体在后台线程里传，写回调把每一块当场交给
-  Python（见 :class:`_StreamReader`），不经过 C 层缓冲，内存占用与响应体大小无关。
+* **stream=True 是真流式**：流由**会话级专职 reactor**（每 Session 至多一个线程，
+  见 :mod:`nb_curl._stream_reactor`）驱动，写回调把每一块当场交给 Python，不经过
+  C 层缓冲；缓冲超过高水位就回 ``CURL_WRITEFUNC_PAUSE``（这一块**不入队**），
+  消费者取到低水位以下才恢复。所以内存占用与响应体大小无关，也不再每流一个线程。
 
 参数（``Session(...)`` / ``get(...)`` 能传什么、怎么给）统一在
 :mod:`nb_curl.params` 声明与说明，本模块只管实现。
@@ -22,6 +24,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import os
 import threading
@@ -512,54 +515,99 @@ class _Handle:
 
 
 class _Pool:
-    """同一指纹下的 handle 池：优先复用空闲 handle，空闲不足则按上限新建。"""
+    """同一分区（指纹 + 连接身份）下的 easy handle 池。
+
+    与旧实现的差别（都是性能/生命周期问题）：
+
+    * 空闲句柄放在 ``deque`` 里，**获取与归还都是 O(1)**（旧版每次 acquire 都线性
+      扫描全部句柄，并发越高越慢）；
+    * ``_total`` 记录"已创建且尚未销毁"的句柄数，上限仍是 ``max_size``
+      —— 保持 ``max_clients`` 的公开含义不变；
+    * :meth:`drain`（会话 close）之后：等待者立刻拿到**确定错误**，不再新建句柄，
+      也不再新建池；
+    * 正在请求的句柄由 :meth:`release` 在归还时关闭 —— 绝不在别处与
+      ``curl_easy_perform`` 抢同一个 handle；
+    * :meth:`discard` 用于"配置失败的半成品句柄"：它**不进池**，直接销毁，
+      池容量当场让出来（否则半个配置的句柄会被下一个请求当成干净句柄复用）。
+    """
 
     def __init__(self, max_size: int):
         self._cond = threading.Condition()
-        self._handles: list[_Handle] = []
+        self._idle: deque[_Handle] = deque()
+        self._total = 0
         self._max = max(1, int(max_size))
         self._draining = False
+        self._closed = False
 
     def acquire(self) -> _Handle:
         with self._cond:
             while True:
-                for handle in self._handles:
-                    if not handle.busy:
-                        handle.busy = True
-                        return handle
-                if len(self._handles) < self._max:
-                    handle = _Handle()
+                if self._closed:
+                    raise NbCurlError("Session 已关闭")
+                if self._idle:
+                    handle = self._idle.pop()          # O(1)
                     handle.busy = True
-                    self._handles.append(handle)
                     return handle
+                if self._total < self._max:
+                    self._total += 1
+                    break
                 self._cond.wait()
+        # 在锁外创建：easy_init() 是跨界调用，不该让其它等待者陪着一起阻塞
+        try:
+            handle = _Handle()
+        except BaseException:
+            with self._cond:
+                self._total -= 1
+                self._cond.notify()
+            raise
+        handle.busy = True
+        return handle
 
     def release(self, handle: _Handle) -> None:
         close_later = False
         with self._cond:
             handle.busy = False
-            if self._draining:
-                # close() 已把空闲 handle 拿走，但本 handle 当时 busy 被跳过；
-                # 现在请求结束，补关掉它，否则它的连接会泄漏。
-                self._handles.remove(handle)
+            if self._closed or self._draining:
+                # close() 已经把空闲句柄收走了；本句柄当时还在跑，现在补关。
+                self._total -= 1
                 close_later = True
-            self._cond.notify()
+                self._cond.notify_all()
+            else:
+                self._idle.append(handle)
+                self._cond.notify()
         if close_later:
             handle.close()
 
+    def discard(self, handle: _Handle) -> None:
+        """半配置 / 损坏的句柄：不进池，直接销毁。
+
+        典型场景：``_configure`` 中途抛异常（选项不合法、指纹下发失败），
+        此时句柄上只落了一半配置 —— 放回池里会让下一个请求踩到脏状态。
+        """
+        with self._cond:
+            handle.busy = False
+            self._total -= 1
+            self._cond.notify()
+        handle.close()
+
     def drain(self) -> list[_Handle]:
-        """取出所有**空闲** handle 供 close；busy（正在请求）的跳过，
-        由 release() 在请求结束后补关，避免与 curl_easy_perform 并发 free。"""
+        """关闭池：取出所有空闲句柄交给调用方释放，并让等待者立即拿到错误。
+
+        busy（正在请求）的句柄跳过，由 :meth:`release` / :meth:`discard`
+        在请求结束后补关 —— 避免与 curl_easy_perform 并发 free 同一个 handle。
+        """
         with self._cond:
             self._draining = True
-            idle = [h for h in self._handles if not h.busy]
-            self._handles = [h for h in self._handles if h.busy]
+            self._closed = True
+            idle = list(self._idle)
+            self._idle.clear()
+            self._total -= len(idle)
             self._cond.notify_all()
         return idle
 
     def __len__(self) -> int:
         with self._cond:
-            return len(self._handles)
+            return self._total
 
 
 # --------------------------------------------------------------------------- #
@@ -623,6 +671,53 @@ def _read_info(handle: _Handle) -> _Info:
     )
 
 
+# --------------------------------------------------------------------------- #
+# 「连接复用失败」自适应重试：同步与异步共用同一套判定
+# --------------------------------------------------------------------------- #
+class _Retry:
+    """一次请求的重试状态机（同步 ``_perform`` 与异步 multi 驱动都用它）。
+
+    语义（与旧实现逐条一致，只是抽出来共用，避免异步侧重写时走样）：
+
+    * 只有幂等方法（``_IDEMPOTENT_METHODS``）才自动重试，非幂等请求绝不重放；
+    * 首次失败后把这个 origin 记进 ``_no_reuse_origins``，之后同一 origin 直接
+      强制新建连接，不再每次都先白失败一次；
+    * 重试次数上限是 ``max_retries``。
+    """
+
+    __slots__ = ("origin", "force_fresh", "attempts_left", "attempt", "wall")
+
+    def __init__(self, session: "Session", prep: _Prep):
+        self.origin = _origin_of(prep.url)
+        with session._no_reuse_lock:
+            self.force_fresh = self.origin in session._no_reuse_origins
+        self.attempts_left = (session.max_retries
+                              if prep.method in _IDEMPOTENT_METHODS else 0)
+        self.attempt = 0
+        self.wall = 0.0
+
+    def fresh_connect(self, tcp_switched: bool = False) -> bool:
+        """本次尝试是否必须新建连接（首次且未标记、且没换 TCP 画像时可以复用）。"""
+        return bool(self.force_fresh or self.attempt or tcp_switched)
+
+    def on_failure(self, session: "Session", code: int, url: str) -> bool:
+        """记一次失败；返回 True = 应当强制新建连接重试。"""
+        if code == 0 or code not in _REUSE_FAILURE_CODES:
+            return False
+        if not self.force_fresh:
+            with session._no_reuse_lock:
+                session._no_reuse_origins.add(self.origin)
+            self.force_fresh = True
+        if self.attempts_left <= 0:
+            return False
+        self.attempts_left -= 1
+        self.attempt += 1
+        if session.debug:
+            print("[nb_curl] 连接复用失败(%d)，强制新建连接重试 #%d: %s"
+                  % (code, self.attempt, url))
+        return True
+
+
 def _build_response(prep: _Prep, info: _Info, status: int, content: bytes,
                     raw_headers: bytes, wall: float, cookie_dump: str) -> Response:
     url = info.url or prep.url
@@ -656,39 +751,55 @@ def _build_response(prep: _Prep, info: _Info, status: int, content: bytes,
 # --------------------------------------------------------------------------- #
 # 流式响应体（stream=True）
 # --------------------------------------------------------------------------- #
-#: 队列里最多先缓冲这么多字节：满了就把写回调卡住，消费者跟不上时靠 TCP 背压让
-#: 服务端慢下来 —— 于是内存占用与响应体大小无关（跟得上时实际只缓冲几十 KB）。
-_STREAM_HIGH_WATER = 1 << 20
 #: 整体读（``Response.content``）时的分块大小
 _STREAM_READ_CHUNK = 65536
-#: close() 等后台线程收尾的秒数
+#: close() 等传输侧收尾的秒数（每条流；bulk close 共享同一份预算）
 _STREAM_CLOSE_GRACE = 1.0
+#: 会话 close 等流式 reactor 线程退出的上限
+_STREAM_REACTOR_GRACE = 5.0
 #: 会被自动跟随的重定向状态码（判断"这个响应块是不是最终响应"用）
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+#: 非阻塞取数的哨兵："现在还没有数据，需要等"
+_NO_DATA = object()
 
 
-class _StreamReader:
-    """``stream=True`` 的响应体：后台线程跑 perform，本类把 chunk 一块块交出去。
+def _set_future_result(fut: Any) -> None:
+    """在事件循环线程上完成一个 Future（已经完成/被取消就跳过）。"""
+    if not fut.done():
+        fut.set_result(None)
 
-    * 后台线程只负责 ``perform``；写回调每收到一块就当场拷成 ``bytes`` 塞进队列
-      （不经过 C 层缓冲），所以 ``iter_content()`` 拿到的是真·增量数据；
-    * 队列到 ``_STREAM_HIGH_WATER`` 就卡住写回调 —— 靠 TCP 背压限速，而不是无限攒内存；
-    * 响应头由 Python 侧的回调累积，因此 ``get(stream=True)`` 返回时 ``status_code`` /
-      ``headers`` 就已经可用（对齐 requests），不必等整个响应体下载完；
-    * 读取是个**游标**：``iter_content()`` 可以分几次接着读，中途 ``break`` 也不丢数据；
-    * ``Response.close()`` 让写回调返回 0，libcurl 立即中止传输并释放连接；
-      响应对象被回收（没人再用它）时也会中止 —— 不会留下后台线程和半开的连接。
+
+class _StreamBody:
+    """``stream=True`` 响应体的公共部分：有界缓冲 + 取数游标 + 状态/异常交付。
+    同步 :class:`Session` 与 :class:`AsyncSession` 的流式都跑在**同一个**会话级
+    专职 reactor 上（见 :mod:`nb_curl._stream_reactor`）：reactor 线程是唯一碰得到
+    native 的人，本类只负责"数据怎么排队、游标怎么走、错误什么时候抛"，因此与
+    "谁在驱动传输"无关。旧实现里"每条流一个后台线程"的传输侧已删除。
+
+    线程契约：
+
+    * 传输侧（reactor 线程）在 ``_lock`` 里只做 O(1) 记账后立刻返回，
+      **绝不在持锁时进 native**、绝不等消费者；
+    * 消费侧（调用线程）可以任意阻塞在 :meth:`_take` 上 —— reactor 独立推进，
+      所以"在事件循环线程里同步调 content / iter_content"不会死锁；
+    * 跨线程交付只走两处：``_cond.notify_all()``（同步等待者）与
+      ``loop.call_soon_threadsafe``（异步等待者，绝不直接 ``set_result``）。
+
+    复用语义（都是既有资产，不只是实现细节）：
+
+    * 游标 ``_pending`` 在**实例**上、且先删后 yield：``iter_content()`` 可以分几次
+      接着读，中途 ``break`` 也不丢已经取出但尚未交出去的字节；
+    * 传输错误先把已经拿到的内容交完，读完再抛（与 requests 的流式语义一致）。
     """
 
     def __init__(self, session: "Session", prep: _Prep, response: Response):
         self._session = session
         self._prep = prep
         # 弱引用：响应对象必须能在"没人用了"的时候被回收 —— 回收时它会回调
-        # close(join=False) 通知我们中止传输。这里要是持强引用，响应就永远收不掉，
-        # 后台线程会一直卡在背压上，线程和连接一起泄漏。
+        # close(join=False) 通知我们中止传输。这里要是持强引用，响应就永远收不掉。
         self._response_ref = weakref.ref(response)
         self._handle: _Handle | None = None
-        self._keepalive: Any = None          # 回调对象，必须活到 perform 结束
+        self._keepalive: Any = None          # 回调对象，必须活到传输结束
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._chunks: deque[bytes] = deque()
@@ -698,42 +809,61 @@ class _StreamReader:
         self._code = 0
         self._error: str | None = None
         self._pxcode: int | None = None          # CURLINFO_PROXY_ERROR（97 才有）
-        self._exc: BaseException | None = None   # perform 之外冒出来的异常，原样抛回调用方
+        self._exc: BaseException | None = None   # 传输之外冒出来的异常，原样抛回
         self._status = 0
-        self._wall = 0.0
         self._blocks: list[tuple[int, str, Headers]] = []
         self._raw_headers = bytearray()
-        self._cookie_dump = ""
+        self._code_dump = ""
         self._transient: list[tuple] = []
+        # 已经取出来、还没交出去的字节。放在实例上而不是生成器局部变量：
+        # 调用方中途 break 之后，这些字节必须留给下一次 iter_content / content。
+        self._pending = bytearray()
         self._consumed = False
-        self._thread: threading.Thread | None = None
-
-    # -- 生命周期 ---------------------------------------------------------- #
-    def start(self, tcp_profile: TcpProfile | None) -> None:
-        """装配独立 handle、起后台线程，并等到**最终响应头**到达再返回。
-
-        独立 handle（不占连接池）是有意的：这块连接完全属于这条流，``close()``
-        能干净地中止它，也不会把"正在流式读"的状态留在池里。
-        """
-        session = self._session
-        handle = _Handle()
-        self._handle = handle
-        session._apply_fingerprint(handle.ptr, self._prep.fingerprint)
-        session._apply_tcp(handle, tcp_profile)
-        session._apply_handle_options(handle.ptr, self._prep)
-        self._transient = session._sync_cookies(
-            handle.ptr, self._prep, handle.pushed_cookies)
-        # 响应体/响应头回调换成 Python 的：数据不再进 C 层缓冲，边到边给
-        self._keepalive = lib.install_stream_callbacks(
-            handle.ptr, self._on_chunk, self._on_header)
-        self._thread = threading.Thread(
-            target=self._run, name="nb-curl-stream", daemon=True)
+        self._closing = False
+        # 传输侧收尾（句柄已释放）后置位：close(join=True) / bulk close 靠它做有界等待
+        self._release_event = threading.Event()
+        # 异步等待者（最多一个）与它所属的事件循环
+        self._async_waiter: Any = None
+        self._loop: Any = None
+        # 建好就登记：这样"响应头还没到 / 还没提交给 reactor"的阶段也能被
+        # Session.close() 及时中止（否则 close 会漏掉它，一直等下去）。
         session._streams.add(self)
-        self._thread.start()
-        self.wait_ready()
 
+    # -- 异步等待者（reactor 线程激活；只在事件循环线程里挂/摘） -------------- #
+    def _new_waiter_locked(self) -> Any:
+        """建一个（当前 loop 上的）等待者并登记；调用方需持锁。"""
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+        fut = loop.create_future()
+        self._async_waiter = fut
+        return fut
+
+    def _drop_waiter(self, fut: Any) -> None:
+        with self._cond:
+            if self._async_waiter is fut:
+                self._async_waiter = None
+
+    def _notify_locked(self) -> None:
+        """唤醒同步与（最多一个）异步等待者；调用方需持锁。
+
+        异步交付一律经 ``call_soon_threadsafe``：reactor 线程直接 ``set_result``
+        会让 Future 的完成回调跑在 reactor 线程上，那是隐蔽的线程错误。
+        """
+        self._cond.notify_all()
+        fut, self._async_waiter = self._async_waiter, None
+        if fut is None or fut.done():
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(_set_future_result, fut)
+        except RuntimeError:      # 循环正在关闭
+            pass
+
+    # -- 生命周期（传输侧钩子由 reactor 实现） ------------------------------ #
     def wait_ready(self) -> None:
-        """等最终响应头到达（或传输结束）。
+        """等最终响应头到达（或传输结束 / 被中止）。
 
         此时 ``status_code`` / ``headers`` 可用，调用方可以据此决定要不要继续读；
         重定向中间跳不算数，等的是跳完之后那一次响应。
@@ -743,30 +873,80 @@ class _StreamReader:
                 self._cond.wait()
         self._raise_pending()
 
-    def close(self, *, join: bool = True) -> None:
-        """中止传输并释放连接；已经结束的流调用它没有副作用。
+    async def wait_ready_async(self) -> None:
+        """``wait_ready`` 的异步版：while 重验谓词（数据/abort/结束都可能提前唤醒）。"""
+        while True:
+            fut = None
+            with self._cond:
+                if not self._done and not self._abort and not self._status:
+                    fut = self._new_waiter_locked()
+            if fut is None:
+                break
+            try:
+                await fut
+            finally:
+                self._drop_waiter(fut)
+        self._raise_pending()
 
-        ``join=False`` 只发中止信号、不等后台线程收尾（``Response.__del__`` 用）——
-        句柄由后台线程自己在退出时释放，避免与正在跑的 ``perform`` 抢同一个 handle。
+    async def wait_data(self) -> None:
+        """等"再来一块数据"（已经可读 / 已结束则立刻返回，不建 Future）。
+
+        while 重验谓词：任何一次提前唤醒（abort/done/notify 竞争）都必须重新
+        检查条件，绝不能"await 一次就当数据到了"。
+        """
+        while True:
+            fut = None
+            with self._cond:
+                if self._chunks or self._done:
+                    return
+                fut = self._new_waiter_locked()
+            try:
+                await fut
+            finally:
+                self._drop_waiter(fut)
+
+    def abort(self) -> None:
+        """只发中止信号（不 join、不碰句柄）。
+
+        写回调会据此返回 False 让 libcurl 立刻收手；**同时**必须通知传输侧
+        （:meth:`_cancel_transport`）——"响应头还没到、一个字节都没收到"的情况下
+        写回调根本没被调用过，光靠它取消不掉，这正是"取消流头前"要覆盖的场景。
         """
         with self._cond:
             self._abort = True
-            self._cond.notify_all()
-        thread = self._thread
-        if not join:
-            return
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(_STREAM_CLOSE_GRACE)
-        if thread is None or not thread.is_alive():
-            self._release_handle()
+            self._notify_locked()
+        self._cancel_transport()
+
+    def close(self, *, join: bool = True) -> None:
+        """中止传输并释放连接；已经结束的流调用它没有副作用。
+
+        ``join=False``（``Response.__del__`` 用）只发中止意图、不等传输侧收尾：
+        句柄归 reactor 线程所有，由它自己释放，避免与正在跑的 native 调用抢。
+        幂等且**允许第二次等待**：第一次 join=False 之后再来一次 join=True，
+        仍要在预算内等同一个 release_event（``_closing`` 只是防止重复发中止
+        意图，不是"跳过等待"的借口）。
+        """
+        first = not self._closing
+        if first:
+            self._closing = True
+        self.abort()
+        if join:
+            self.wait_released(_STREAM_CLOSE_GRACE)
+
+    def wait_released(self, timeout: float) -> bool:
+        """等传输侧真的收尾（句柄已释放）；返回是否在预算内完成。"""
+        return self._release_event.wait(max(0.0, timeout))
+
+    def _cancel_transport(self) -> None:
+        """通知传输侧中止（基类默认无传输：什么都没发生）。"""
+        return None
 
     def _release_handle(self) -> None:
-        """清理 native handle（幂等；后台线程收尾时也会调）。
+        """清理 native handle（幂等）。
 
         必须走 :meth:`_Handle.close`（它会把 ``ptr`` 置空）而不是直接
-        ``easy_cleanup(handle.ptr)``：否则 ``_Handle`` 对象被回收时
-        ``__del__`` 会拿着同一个指针再 free 一次 —— 双重释放，之后新建的
-        handle 会踩到坏内存，表现为莫名其妙的下发失败。
+        ``easy_cleanup(handle.ptr)``：否则 ``_Handle`` 对象被回收时 ``__del__``
+        会拿着同一个指针再 free 一次 —— 双重释放，之后新建的 handle 会踩到坏内存。
         """
         with self._lock:
             handle, self._handle = self._handle, None
@@ -776,6 +956,7 @@ class _StreamReader:
                 handle.close()
             except Exception:  # noqa: BLE001
                 pass
+        self._release_event.set()
 
     # -- 状态 -------------------------------------------------------------- #
     @property
@@ -785,7 +966,7 @@ class _StreamReader:
 
     @property
     def finished(self) -> bool:
-        """后台传输是否已经结束（不代表数据都被取走了）。"""
+        """传输是否已经结束（不代表数据都被取走了）。"""
         with self._cond:
             return self._done
 
@@ -794,21 +975,14 @@ class _StreamReader:
         """是否已经开始被读取过（流是游标，可以接着往下读）。"""
         return self._consumed
 
-    # -- 回调（都在后台线程里被 native 层调用） ---------------------------- #
-    def _on_chunk(self, data: bytes) -> bool:
-        """写回调：收一块响应体。返回 False 中止传输。"""
-        with self._cond:
-            while self._buffered >= _STREAM_HIGH_WATER and not self._abort:
-                self._cond.wait()            # 消费者还没取走，先卡住（TCP 背压）
-            if self._abort:
-                return False
-            self._chunks.append(data)
-            self._buffered += len(data)
-            self._cond.notify_all()
-        return True
-
+    # -- 头回调（传输侧线程调用） ------------------------------------------ #
     def _on_header(self, line: bytes) -> bool:
-        """头回调：逐行累积响应头，攒完一块就刷新状态（含状态行）。"""
+        """头回调：逐行累积响应头，攒完一块就刷新状态（含状态行）。
+
+        头块很小，不做背压；1xx 与代理 CONNECT 块由 :func:`parse_header_blocks`
+        过滤，重定向中间跳由 :meth:`_refresh_locked` 过滤 —— 只有最终块置
+        ``status_code``。
+        """
         with self._cond:
             if self._abort:
                 return False
@@ -841,57 +1015,11 @@ class _StreamReader:
                          reason=r, elapsed=0.0)
                 for c, r, h in self._blocks[:-1]
             ]
-        self._cond.notify_all()
-
-    # -- 后台线程 ---------------------------------------------------------- #
-    def _run(self) -> None:
-        handle = self._handle
-        started = time.perf_counter()
-        try:
-            code, status, _body, raw_headers, error = lib.perform(handle.ptr)
-            pxcode = lib.getinfo_long(handle.ptr, CURLINFO_PROXY_ERROR) or None
-            with self._cond:
-                self._code = code
-                self._error = error
-                self._pxcode = pxcode
-                if status and not self._status:
-                    self._status = status      # 无响应体时（HEAD / 204）靠它兜底
-                if raw_headers:
-                    self._raw_headers.extend(raw_headers)
-                self._cookie_dump = lib.get_cookies(handle.ptr)
-            self._wall = time.perf_counter() - started
-            self._finish()
-        except BaseException as exc:  # noqa: BLE001
-            with self._cond:
-                self._exc = exc
-        finally:
-            with self._cond:
-                self._done = True
-                self._cond.notify_all()
-            self._release_handle()
-
-    def _finish(self) -> None:
-        """传输结束：收尾 cookie（含撤掉本次专用项）并补上最终元信息。"""
-        handle = self._handle
-        session = self._session
-        if handle is not None:
-            if self._transient:
-                session._drop_transient_cookies(
-                    handle.ptr, self._transient, handle.pushed_cookies)
-            resp = self._response_ref()
-            if resp is not None:
-                info = _read_info(handle)
-                resp.url = info.url or resp.url
-                resp.http_version = http_version_name(int(info.http_version))
-                resp.primary_ip = info.primary_ip
-                resp.redirect_count = info.redirect_count
-                resp.elapsed = timedelta(seconds=info.total_time or self._wall)
-        session.cookies._absorb(
-            self._cookie_dump, time.time(), frozenset(self._transient))
+        self._notify_locked()
 
     # -- 取数 -------------------------------------------------------------- #
     def iter_chunks(self, chunk_size: int = 8192) -> Iterator[bytes]:
-        """逐块产出响应体。
+        """逐块产出响应体（同步）。
 
         流是一个**游标**：可以分多次调用接着往下读（与 requests 一致），
         也可以中途 ``break`` —— 剩下的数据还在，交给 ``content`` 或下一次
@@ -901,17 +1029,48 @@ class _StreamReader:
         return self._iter_chunks(max(1, int(chunk_size)))
 
     def _iter_chunks(self, size: int) -> Iterator[bytes]:
-        pending = bytearray()
+        pending = self._pending     # 游标：跨调用、跨 break 都保留
         while True:
             data = self._take()
             if data is None:
                 break
             pending += data
             while len(pending) >= size:
-                yield bytes(pending[:size])
+                # 必须**先**从缓冲里删掉再 yield：生成器会停在 yield 上，
+                # 若先 yield，字节还留在 pending 里，下次读取会再投递一遍（正文重复）。
+                chunk = bytes(pending[:size])
                 del pending[:size]
+                yield chunk
         if pending:
-            yield bytes(pending)
+            chunk = bytes(pending)
+            del pending[:]
+            yield chunk
+        self._raise_pending()
+
+    async def aiter_chunks(self, size: int) -> Any:
+        """``_iter_chunks`` 的异步版：同一套游标语义，挂起时只等数据。
+
+        每挂起一次只建一个 Future（由 reactor 线程唤醒），**不再**每块都
+        ``asyncio.to_thread(next, iterator)`` —— 那样每块都要动一次线程。
+        """
+        self._consumed = True
+        pending = self._pending
+        while True:
+            data = self._take_nowait()
+            while data is _NO_DATA:
+                await self.wait_data()
+                data = self._take_nowait()
+            if data is None:
+                break
+            pending += data
+            while len(pending) >= size:
+                chunk = bytes(pending[:size])
+                del pending[:size]
+                yield chunk
+        if pending:
+            chunk = bytes(pending)
+            del pending[:]
+            yield chunk
         self._raise_pending()
 
     def read_all(self) -> bytes:
@@ -928,11 +1087,27 @@ class _StreamReader:
                 if self._chunks:
                     data = self._chunks.popleft()
                     self._buffered -= len(data)
-                    self._cond.notify_all()   # 唤醒可能正卡在水位上的写回调
+                    self._after_take_locked()     # 通知传输侧可以继续收
                     return data
                 if self._done:
                     return None
                 self._cond.wait()
+
+    def _take_nowait(self) -> Any:
+        """非阻塞取数：``bytes`` / ``None``（结束且没剩余）/ :data:`_NO_DATA`（还没到）。"""
+        with self._cond:
+            if self._chunks:
+                data = self._chunks.popleft()
+                self._buffered -= len(data)
+                self._after_take_locked()
+                return data
+            if self._done:
+                return None
+            return _NO_DATA
+
+    def _after_take_locked(self) -> None:
+        """消费者取走一块之后的通知钩子（调用方持锁）；传输侧按需覆写。"""
+        self._cond.notify_all()
 
     def _raise_pending(self) -> None:
         """传输异常时抛对应的异常（正常结束 / 主动 close 不抛）。
@@ -946,11 +1121,23 @@ class _StreamReader:
             abort, done, has_data = self._abort, self._done, bool(self._chunks)
         if exc is not None:
             raise exc
-        if done and not has_data and not abort and code not in (0, _CURLE_WRITE_ERROR):
-            self._session._raise_for_code(
-                code, error or lib.strerror(code),
-                proxy_error=pxcode,
-                proxy_in_use=_proxy_in_use(self._prep.proxy, self._prep.url))
+        if not done or has_data or abort or code == 0:
+            return
+        if code == _CURLE_WRITE_ERROR:
+            # 只有"我们主动中止"才允许吞掉这条错误（abort 已在上面返回）。
+            # 走到这里说明写回调真的失败了，不能伪装成正常结束。
+            raise RequestError(curl_error_detail(
+                code, "响应体写入被中止（写回调返回失败）: %s"
+                % (error or lib.strerror(code))), code)
+        self._session._raise_for_code(
+            code, error or lib.strerror(code),
+            proxy_error=pxcode,
+            proxy_in_use=_proxy_in_use(self._prep.proxy, self._prep.url))
+
+
+# 把公共基类交给 reactor 侧组合（ReactorStream 的消费接口由 _StreamBody 提供）
+from ._stream_reactor import _bind_stream_body as _bind_stream_body  # noqa: E402
+_bind_stream_body(_StreamBody)
 
 
 # --------------------------------------------------------------------------- #
@@ -966,7 +1153,7 @@ class Session(SessionShortcuts):
     或 ``nb_curl.params.describe()``）。常用写法：
 
     >>> import nb_curl
-    >>> with nb_curl.Session(impersonate="chrome152") as s:
+    >>> with nb_curl.Session(impersonate="chrome155") as s:
     ...     s.get("https://example.com", http_version="2", timeout=10)
     ...     s.post("https://example.com/api", json={"k": "v"},
     ...            tcp={"window": 64240, "wscale": 8}, ttl=64)
@@ -974,7 +1161,6 @@ class Session(SessionShortcuts):
 
     def __init__(self, **options: Unpack[SessionOptions]):
         check_options("Session()", options, SESSION_KEYS)
-
         # impersonate 也可直接传 Fingerprint 对象（等价于会话级快照）
         impersonate = options.get("impersonate")
         fp_snapshot_arg: Fingerprint | None = None
@@ -1024,6 +1210,7 @@ class Session(SessionShortcuts):
         self.http_version = http_version
         self.max_clients = max(1, int(_session_default(options, "max_clients")))
         self.max_retries = max(0, int(_session_default(options, "max_retries")))
+        self.graceful_close = _session_default(options, "graceful_close")
         self.debug = _session_default(options, "debug")
 
         # 连接 / 解析类 option：影响句柄状态，所以都进连接池 key
@@ -1058,8 +1245,16 @@ class Session(SessionShortcuts):
         # 已知"复用会失败"的 origin：后续请求直接强制新建连接，不再每次白白失败一次
         self._no_reuse_origins: set[tuple] = set()
         self._no_reuse_lock = threading.Lock()
-        # 还活着的流式响应（弱引用）：close() 时要把它们的后台传输一起中止
+        # 还活着的流式响应（弱引用）：close() 时要把它们的传输一起中止
         self._streams: weakref.WeakSet = weakref.WeakSet()
+        # 流式专职 reactor（每 Session 至多一个，惰性创建；见 _stream_reactor）
+        self._stream_reactor: Any = None
+        # 惰性创建互斥：20 个线程 barrier 同时首次 stream 也只允许创建一个
+        # reactor 实例（review-poll-core：session 层懒创建无锁会出现 3 个 reactor）
+        self._reactor_lock = threading.Lock()
+        # 异步 multi 驱动（只有 AsyncSession 会装上；同步 Session 恒为 None）。
+        # 放在基类里，close() 才能在库里统一处理，不必依赖子类的析构顺序。
+        self._async_driver: Any = None
         # stream=True 与 tcp= 同用时，事后校验做不了 —— 只提醒一次
         self._stream_tcp_warned = False
         self._closed = False
@@ -1074,29 +1269,132 @@ class Session(SessionShortcuts):
         self.close()
 
     def close(self) -> None:
-        # 流式响应先收掉：它们的后台传输还占着连接，得先中止再关句柄
-        for reader in list(self._streams):
+        # 先置关闭位：新请求立即被拒，正在等池的 acquire 也会拿到确定错误
+        self._closed = True
+
+        # 异步驱动先停（取消在飞传输、关闭 multi）；它自己保证只收尾一次。
+        # graceful_close 时**有界等 owner 线程收完连接再关池**：连接释放与
+        # easy_cleanup 并发会让 libcurl 跳过优雅关闭路径直接 close —— 接收队列里
+        # 还有对端字节时那就是 RST（旧版阻塞式收尾不会被这条路径踩到）。
+        driver, self._async_driver = self._async_driver, None
+        if driver is not None:
             try:
-                reader.close()
+                driver.close(wait=bool(self.graceful_close))
             except Exception:  # noqa: BLE001
                 pass
+
+        # 流式：先停 reactor（一次唤醒就能拆掉全部在飞流），再有界等待收尾
+        self._shutdown_streams(wait=True)
+
+        self._close_pools()
+
+    def _close_abandoned(self) -> None:
+        """``__del__`` 专用收尾：只发"停止/取消"意图，绝不等 owner 线程。
+
+        析构发生在哪个线程、什么时候都不确定，等它等于把 GC 卡住（而且驱动此刻
+        可能正在 free 同一个 multi / easy）。有序收尾是 :meth:`close` 的职责。
+        """
+        self._closed = True
+        driver, self._async_driver = self._async_driver, None
+        if driver is not None:
+            try:
+                driver.close(wait=False)
+            except Exception:  # noqa: BLE001
+                pass
+        self._shutdown_streams(wait=False)
+        self._close_pools()
+
+    def _close_pools(self) -> None:
+        """关闭全部连接池并把空闲句柄交回 native。"""
         with self._pools_lock:
             pools = list(self._pools.values())
             self._pools.clear()
         for pool in pools:
             for handle in pool.drain():
                 handle.close()
-        self._closed = True
+
+    def _shutdown_streams(self, *, wait: bool) -> None:
+        """停掉流式 reactor 并收掉所有还开着的流。
+
+        ``wait=True``（close()）：有界等待——每条流 1s 共享预算 + reactor 线程退出；
+        ``wait=False``（``__del__``）：只发中止意图，绝不与 reactor 抢 native 资源。
+
+        ``AsyncSession`` 的异步 close 会自己先 ``await to_thread(reactor.wait_closed)``，
+        那时这里的 reactor 已经是 ``None``，于是不会在事件循环线程上阻塞。
+        """
+        # 与 _reactor_for_streams 同锁：close 与"首次 stream 惰性创建"交错时，
+        # 要么创建先拿到锁（reactor 进清理列表被正常关闭），要么 close 先拿到
+        # 锁（之后创建路径看到 _closed 直接报错），不会漏掉任何 reactor。
+        with self._reactor_lock:
+            reactor, self._stream_reactor = self._stream_reactor, None
+        if reactor is not None:
+            try:
+                reactor.stop(wait=False)      # 只发"停止 + 取消全部"意图
+            except Exception:  # noqa: BLE001
+                pass
+        self._close_streams(wait=wait)
+        if wait and reactor is not None:
+            reactor.wait_closed(_STREAM_REACTOR_GRACE)
+
+    def _close_streams(self, *, wait: bool = True) -> None:
+        """中止所有还活着的流式响应。
+
+        先把中止意图**全部**发出去（一次唤醒就能让 reactor 拆掉全部在飞传输），
+        再按**共享的** 1s 预算等它们真的收尾 —— 不会因为并发流多就把 close
+        拖成 N 秒。``wait=False`` 只发意图。
+        """
+        readers = list(self._streams)
+        for reader in readers:
+            try:
+                reader.abort()
+            except Exception:  # noqa: BLE001
+                pass
+        deadline = time.monotonic() + _STREAM_CLOSE_GRACE
+        for reader in readers:
+            try:
+                reader.close(join=False)      # 幂等：只置状态，不等待
+                if wait:
+                    reader.wait_released(max(0.0, deadline - time.monotonic()))
+            except Exception:  # noqa: BLE001
+                pass
 
     def __del__(self):  # pragma: no cover - 兜底
+        """析构只发"取消意图"：绝不等 reactor / 驱动线程收尾（那是 close() 的事）。"""
         try:
-            self.close()
+            self._close_abandoned()
         except Exception:  # noqa: BLE001
             pass
 
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def stream_mode(self) -> str:
+        """流式走的传输路径：``reactor``（会话级专职线程）/ ``unstarted``。
+
+        只是可观测性字段（用来证明没有偷偷回退到"每条流一个线程"），不是公开 API。
+        """
+        return "reactor" if self._stream_reactor is not None else "unstarted"
+
+    def _reactor_for_streams(self) -> Any:
+        """取（首次则创建）本会话的流式 reactor —— 每个 Session 至多一个。
+
+        check-then-create 必须与 close 走同一把锁（``_reactor_lock``）：否则
+        barrier 并发首次 stream 会各建一个 reactor（各带一个线程），close 与
+        create 交错时又会把刚创建的 reactor 从清理列表里漏掉。
+        """
+        with self._reactor_lock:
+            reactor = self._stream_reactor
+            if reactor is not None:
+                return reactor
+            if self._closed:
+                raise NbCurlError("Session 已关闭")
+            from ._stream_reactor import StreamReactor
+
+            reactor = StreamReactor(self)
+            self._stream_reactor = reactor
+            return reactor
 
     # ------------------------------------------------------------------ #
     # 内部：指纹与连接池
@@ -1176,6 +1474,10 @@ class Session(SessionShortcuts):
 
     def _pool_for(self, key: tuple) -> _Pool:
         with self._pools_lock:
+            if self._closed:
+                # close() 与本调用之间的竞态：关闭后**不再新建池**（否则新池
+                # 不在 close 的清理列表里，里面的连接会泄漏到会话之外）
+                raise NbCurlError("Session 已关闭")
             pool = self._pools.get(key)
             if pool is None:
                 pool = _Pool(self.max_clients)
@@ -1255,7 +1557,9 @@ class Session(SessionShortcuts):
             int(verify),
             ca_path or "",
             http_version,
-            proxy or "",
+            # proxy=None（跟随环境变量）与 proxy=""（显式禁用代理）**不能折叠**：
+            # 两者连接身份不同，折叠会让"显式禁用"的请求复用上一条走了代理的连接。
+            ("env",) if proxy is None else ("set", proxy),
             # resolve 会写进 handle 自带的 DNS 缓存且不会自动清，故按条目分区
             tuple(resolve_entries),
             _ech_value(ech) or "",
@@ -1327,6 +1631,9 @@ class Session(SessionShortcuts):
             value = _ech_value(prep.ech)
             if value:
                 lib.set_option_string(ptr, CurlOpt.ECH, value.encode("utf-8"))
+            else:
+                # ech=False -> 显式关掉（NULL 复位），不能靠"不设置"来偷懒
+                lib.set_option_string(ptr, CurlOpt.ECH, None)
         if prep.doh:
             lib.set_option_string(ptr, CurlOpt.DOH_URL, _as_bytes(prep.doh))
         if prep.dns_cache_ttl is not None:
@@ -1367,12 +1674,16 @@ class Session(SessionShortcuts):
                 raise RequestError(curl_error_detail(
                     code, "设置 http_version=%r 失败: %s"
                     % (prep.http_version, lib.strerror(code))))
-        if prep.timeout:
-            lib.easy_set_timeout(ptr, int(float(prep.timeout) * 1000))
-        if prep.connect_timeout:
-            lib.easy_set_connect_timeout(ptr, int(float(prep.connect_timeout) * 1000))
-        if prep.userpwd:
-            lib.easy_set_userpwd(ptr, prep.userpwd.encode("utf-8"))
+        # 这三项不会因为"这次没传"而自动消失：句柄是池里复用的，
+        # 上一请求留下的 timeout / auth 会继续生效（配置残留 = 行为漂移）。
+        # 所以这里**每次显式下发**，没有就写 0 / NULL 复位。
+        lib.easy_set_timeout(
+            ptr, int(float(prep.timeout) * 1000) if prep.timeout else 0)
+        lib.easy_set_connect_timeout(
+            ptr, int(float(prep.connect_timeout) * 1000)
+            if prep.connect_timeout else 0)
+        lib.easy_set_userpwd(
+            ptr, prep.userpwd.encode("utf-8") if prep.userpwd else None)
 
         lib.easy_set_header_lines(ptr, _header_lines_arg(prep.headers))
         # 这一行是**故意**不写 CURLOPT_COOKIE 的：cookie 只有内建引擎一条通道
@@ -1510,37 +1821,20 @@ class Session(SessionShortcuts):
 
         返回 ``(code, status, content, raw_headers, error, 累计墙钟耗时)``。
         """
-        origin = _origin_of(prep.url)
-        with self._no_reuse_lock:
-            force_fresh = origin in self._no_reuse_origins
-        attempts_left = self.max_retries if prep.method in _IDEMPOTENT_METHODS else 0
-        attempt = 0
-        wall = 0.0
+        retry = _Retry(self, prep)
 
         while True:
             # attempt 0 且该 origin 未被标记 -> 允许复用；否则强制新建连接。
             lib.easy_set_fresh_connect(
-                handle.ptr, 1 if (force_fresh or attempt or tcp_switched) else 0)
+                handle.ptr, 1 if retry.fresh_connect(tcp_switched) else 0)
             started = time.perf_counter()
             code, status, content, raw_headers, error = lib.perform(handle.ptr)
-            wall += time.perf_counter() - started
+            retry.wall += time.perf_counter() - started
 
-            if code == 0 or code not in _REUSE_FAILURE_CODES:
+            if not retry.on_failure(self, code, prep.url):
                 break
-            if not force_fresh:
-                # 记住这个 origin：以后直接新建连接，避免每次都先失败一次
-                with self._no_reuse_lock:
-                    self._no_reuse_origins.add(origin)
-                force_fresh = True
-            if attempts_left <= 0:
-                break
-            attempts_left -= 1
-            attempt += 1
-            if self.debug:
-                print("[nb_curl] 连接复用失败(%d)，强制新建连接重试 #%d: %s"
-                      % (code, attempt, prep.url))
 
-        return code, status, content, raw_headers, error, wall
+        return code, status, content, raw_headers, error, retry.wall
 
     @staticmethod
     def _raise_for_code(code: int, message: str, *,
@@ -1570,6 +1864,71 @@ class Session(SessionShortcuts):
     # ------------------------------------------------------------------ #
     # 执行
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # 共享生命周期：prepare -> acquire/configure -> execute -> finish
+    # 同步、异步、流式、WebSocket 都复用下面这几个阶段，
+    # 区别只在"谁执行"（curl_easy_perform / multi 驱动 / 后台流式线程）。
+    # ------------------------------------------------------------------ #
+    def _acquire_configured(self, prep: _Prep, tcp_profile: TcpProfile | None):
+        """取一个池内句柄并完成全部配置。
+
+        返回 ``(pool, handle, (rcvbuf_plan, tcp_switched, transient_cookies))``。
+
+        配置失败时句柄**不进池**（:meth:`_Pool.discard` 直接销毁）：
+        半个配置的句柄被下一个请求复用会踩到脏状态，比多建一次连接昂贵得多。
+        """
+        pool = self._pool_for(prep.key)
+        handle = pool.acquire()
+        try:
+            staged = self._configure(handle, prep, tcp_profile)
+        except BaseException:
+            pool.discard(handle)
+            raise
+        return pool, handle, staged
+
+    def _configure(self, handle: "_Handle", prep: _Prep,
+                   tcp_profile: TcpProfile | None):
+        """把指纹 / TCP 画像 / 句柄选项 / cookie 全部落到句柄上（四个路径共用）。"""
+        self._apply_fingerprint(handle.ptr, prep.fingerprint)
+        rcvbuf_plan, tcp_switched = self._apply_tcp(handle, tcp_profile)
+        self._apply_handle_options(handle.ptr, prep)
+        transient = self._sync_cookies(handle.ptr, prep, handle.pushed_cookies)
+        return rcvbuf_plan, tcp_switched, transient
+
+    def _collect_result(self, handle: "_Handle", prep: _Prep,
+                        transient: Sequence[tuple]):
+        """传输结束后的收尾读数：getinfo + cookie 导出 + 撤掉本次专用 cookie。
+
+        撤临时 cookie 放在 ``finally``：读数中途失败也必须撤，否则这些"只属于本次
+        请求"的 cookie 会留在句柄的 cookie 引擎里。
+        """
+        try:
+            info = _read_info(handle)
+            cookie_dump = lib.get_cookies(handle.ptr)
+        finally:
+            if transient:
+                try:
+                    self._drop_transient_cookies(
+                        handle.ptr, transient, handle.pushed_cookies)
+                except Exception:  # noqa: BLE001 - 撤除失败不改写读数结果
+                    pass
+        return info, cookie_dump
+
+    def _finish(self, prep: _Prep, info: "_Info", cookie_dump: str,
+                transient: Sequence[tuple], code: int, error: str | None) -> None:
+        """共享收尾：吸收 cookie，然后按 CURLcode 抛对应异常（0 = 正常）。"""
+        if info is None:
+            # 结构保证：只有"真的传输完并读过结果"的 transfer 才允许走到这里。
+            # 中止/失败一律交付明确异常，不许变成成功空正文或 AttributeError。
+            raise NbCurlError(
+                "内部状态错误：本次请求没有收尾信息（不应被当作成功交付）")
+        self.cookies._absorb(cookie_dump, time.time(), frozenset(transient))
+        if code != 0:
+            self._raise_for_code(
+                code, error or lib.strerror(code),
+                proxy_error=info.proxy_error,
+                proxy_in_use=_proxy_in_use(prep.proxy, prep.url))
+
     def _request(self, method: str, url: str,
                  **options: Unpack[RequestOptions]) -> Response:
         """执行一次请求。
@@ -1586,39 +1945,41 @@ class Session(SessionShortcuts):
         if prep.stream:
             return self._request_stream(prep, tcp_profile)
 
-        pool = self._pool_for(prep.key)
-        handle = pool.acquire()
-        cookie_dump = ""
-        transient: list[tuple] = []
+        pool, handle, staged = self._acquire_configured(prep, tcp_profile)
+        rcvbuf_plan, tcp_switched, transient = staged
+        reusable = False
         try:
-            self._apply_fingerprint(handle.ptr, prep.fingerprint)
-            rcvbuf_plan, tcp_switched = self._apply_tcp(handle, tcp_profile)
-            self._apply_handle_options(handle.ptr, prep)
-            transient = self._sync_cookies(handle.ptr, prep, handle.pushed_cookies)
             code, status, content, raw_headers, error, wall = self._perform(
                 handle, prep, rcvbuf_plan, tcp_switched)
             self._verify_tcp(handle, code, tcp_profile, rcvbuf_plan)
-            info = _read_info(handle)
-            cookie_dump = lib.get_cookies(handle.ptr)
-            if transient:
-                self._drop_transient_cookies(handle.ptr, transient, handle.pushed_cookies)
+            info, cookie_dump = self._collect_result(handle, prep, transient)
+            reusable = True
         finally:
-            pool.release(handle)
+            # 收尾/读数中途抛异常 = 这只句柄的状态已不确定（临时 cookie、
+            # 只读了一半的传输都在上面）：销毁而不是放回池里污染下一个请求。
+            if reusable:
+                pool.release(handle)
+            else:
+                pool.discard(handle)
 
-        self.cookies._absorb(cookie_dump, time.time(), frozenset(transient))
-        if code != 0:
-            self._raise_for_code(code, error or lib.strerror(code),
-                                 proxy_error=info.proxy_error,
-                                 proxy_in_use=_proxy_in_use(prep.proxy, prep.url))
+        self._finish(prep, info, cookie_dump, transient, code, error)
         return _build_response(prep, info, status, content, raw_headers, wall, cookie_dump)
 
-    def _request_stream(self, prep: _Prep, tcp_profile: TcpProfile | None) -> Response:
-        """流式下载：独立 handle + 后台线程，响应体在写回调里当场交给 Python。
+    def _stream_reader(self, prep: _Prep) -> tuple[Response, "_StreamBody"]:
+        """建好流式响应与读取器（**不启动**），并确保它已被登记进 ``_streams``。
 
-        ``stream=True`` 走这条路 —— 不等整个响应体下载完（那样内存占用就等于文件大小），
-        而是调用方要一块给一块。独立 handle 的代价是这类请求不复用连接池里的连接，
-        换来的是一块连接完全由这条流独占（``close()`` 能干净地中止它）。
+        调用方必须在启动前拿到这两个对象：``AsyncSession`` 要在事件循环线程里
+        建它（这样"响应头还没到就被取消/关闭"也能及时中止），而真正的装配与传输
+        由会话级 reactor 做。
         """
+        if self._closed:
+            raise NbCurlError("Session 已关闭")
+        from ._stream_reactor import ReactorStream
+
+        class _ReactorStream(ReactorStream, _StreamBody):
+            """基类（消费接口）+ reactor 传输侧的组合（见 _stream_reactor）。"""
+            __doc__ = ReactorStream.__doc__
+
         response = Response(
             status_code=0,
             headers=Headers(),
@@ -1626,8 +1987,25 @@ class Session(SessionShortcuts):
             url=prep.url,
             request=Request(prep.method, prep.url, Headers(prep.headers)),
         )
-        reader = _StreamReader(self, prep, response)
+        reader = _ReactorStream(self, prep, response)   # 构造时即登记进 _streams
         response._stream = reader
+        if self._closed:
+            # 与 close() 的枚举赛跑：登记之后再看一次关闭位，窗口就闭合了
+            reader.close(join=False)
+            raise NbCurlError("Session 已关闭")
+        return response, reader
+
+    def _request_stream(self, prep: _Prep, tcp_profile: TcpProfile | None) -> Response:
+        """流式下载（同步）：独立句柄 + **会话级 reactor**，响应体在写回调里当场交给 Python。
+
+        ``stream=True`` 走这条路 —— 不等整个响应体下载完（那样内存占用就等于文件
+        大小），而是调用方要一块给一块。独立句柄的代价是这类请求不复用连接池里的
+        连接，换来的是一块连接完全由这条流独占（``close()`` 能干净地中止它）。
+
+        读完之前调用方一直阻塞在 ``_take()`` 上，但传输跑在 reactor 线程：
+        所以在事件循环里同步调 ``content`` / ``iter_content`` 也不会死锁。
+        """
+        response, reader = self._stream_reader(prep)
         if tcp_profile is not None:
             self._warn_stream_tcp(tcp_profile)
         try:
@@ -1649,7 +2027,7 @@ class Session(SessionShortcuts):
 
         内部用独立 handle（不走连接池），``ws.close()`` 时释放。
         """
-        from .ws import WebSocket
+        from .ws import WebSocket, configure_ws_handshake
 
         check_options("ws_connect()", options, REQUEST_KEYS | {"subprotocol"})
         if self._closed:
@@ -1668,6 +2046,9 @@ class Session(SessionShortcuts):
             self._apply_fingerprint(ptr, prep.fingerprint)
             self._apply_handle_options(ptr, prep, handshake=True)
             lib.set_option_long(ptr, CurlOpt.CONNECT_ONLY, 2)  # 进入 ws 模式
+            # 握手前关掉 libcurl 的自动 PONG（CURLWS_NOAUTOPONG）：自动 PONG 只排进
+            # 内部 pending，纯 recv 轮询永远不会被 flush；PONG 由 WebSocket.recv 回。
+            configure_ws_handshake(ptr, lib)
 
             code, status, body, raw_head, err = lib.perform(ptr)
             if code != 0:

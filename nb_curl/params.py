@@ -14,7 +14,7 @@
 
 常用组合速查：
 
-    指纹    impersonate="chrome152" / ja3="…" / akamai="…" / diy_fp={…} / fp_file="x.json"
+    指纹    impersonate="chrome155" / ja3="…" / akamai="…" / diy_fp={…} / fp_file="x.json"
     协议    http_version="2" | "3" | "1.1"
     证书    verify=False / ca_path="ca.pem" / pinned_key="sha256//…"
     代理    proxy="socks5h://127.0.0.1:1080" / proxies={"https": "…"}；proxy="" 屏蔽环境代理
@@ -162,11 +162,11 @@ class RequestOptions(TypedDict, total=False):
 
     # -- 指纹 -------------------------------------------------------------- #
     impersonate: ImpersonateTarget | str | Fingerprint | None
-    """内置浏览器预设名，如 ``"chrome152"`` / ``"firefox147"``；
+    """内置浏览器预设名，如 ``"chrome155"`` / ``"firefox147"``；
     家族别名（``"chrome"``）自动取该家族最新版；也可直接传
     ``Fingerprint`` 对象（``parse_xcctls()`` 的结果）。
     完整清单：``nb_curl.available_targets()``。
-    加 ``":no"`` 后缀（``"chrome152:no"``）= 不带该预设的浏览器默认请求头。"""
+    加 ``":no"`` 后缀（``"chrome155:no"``）= 不带该预设的浏览器默认请求头。"""
 
     ja3: str | None
     """JA3 串 ``TLS版本,套件,扩展,group,EC点格式``，覆盖预设的 TLS 层。
@@ -287,6 +287,15 @@ class SessionOptions(RequestOptions, total=False):
     max_retries: int
     """幂等请求遇到「连接复用失败」时的重试次数。默认 2。"""
 
+    graceful_close: bool
+    """``close()`` 是否等驱动把 keep-alive 连接按 libcurl 的正常顺序关完。默认 ``True``。
+
+    打开时 ``close()`` 等连接真的发完 FIN 才返回（浏览器式：服务端先关、客户端再回
+    FIN），代价是空闲连接要等对端 FIN，最多几百毫秒 —— 与旧版阻塞式实现一致。
+    关掉它 ``close()`` 立刻返回、残留连接交给驱动线程后台释放：更快，但连接可能以
+    RST 收尾。只影响 ``AsyncSession`` 的 ``close()``（同步版关连接走的是 easy 句柄
+    自己的收尾路径，本来就是优雅的），与普通请求的耗时无关。"""
+
     debug: bool
     """``True`` 时把 libcurl 的 verbose 输出打到 stderr。默认 ``False``。"""
 
@@ -321,6 +330,7 @@ SESSION_DEFAULTS: dict[str, Any] = {
     "default_headers": True,
     "max_clients": 1,
     "max_retries": 2,
+    "graceful_close": True,
     "debug": False,
     "allow_dangerous_options": False,
 }

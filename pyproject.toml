@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nb-curl"
-version = "0.3.0"
+version = "0.3.1"
 description = "自带浏览器 TLS/HTTP2 指纹的 HTTP 客户端（libcurl-impersonate + BoringSSL）"
 readme = "README.md"
 requires-python = ">=3.9"
