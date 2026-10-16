@@ -7,7 +7,7 @@
 ```python
 from nb_curl import requests
 
-r = requests.get("https://www.xcctls.top/all", impersonate="chrome152")
+r = requests.get("https://www.xcctls.top/all", impersonate="chrome155")
 print(r.status_code, r.http_version)   # 200 2
 ```
 
@@ -18,11 +18,11 @@ print(r.status_code, r.http_version)   # 200 2
 ```bash
 pip install nb-curl
 
-# 或下载 wheel 手动装（Releases 页有 Windows x64 / Linux x86_64）
-pip install nb_curl-0.3.0-py3-none-win_amd64.whl
+# 或下载 wheel 手动装（Releases 页有 Windows x64 / Linux manylinux_2_28 x86_64）
+pip install nb_curl-0.3.1-py3-none-win_amd64.whl
 ```
 
-支持平台：Windows x64、Linux x86_64。
+支持平台：Windows x64、Linux x86_64（`manylinux_2_28`）。
 
 ---
 
@@ -62,9 +62,25 @@ HTTP/2 指纹与请求头等维度扣分。同一台机器、同一个检测站�
 （同场景 requests / httpx / requests_go 约 1.12～1.15 ms，curl_cffi 约 1.19 ms）。
 纯异步的 aiohttp 吞吐更高（并列并发下约 5,600 req/s），代价是它不具备任何指纹仿真能力。
 
+**0.3.1 的异步重构实测** —— 0.3.1 把异步非流式路径从「每请求一个线程」的线程池换成 libcurl multi
+驱动（Windows 用有界专职驱动线程，POSIX 直接挂在调用方事件循环上），高并发下的吞吐与延迟明显改善。
+同机回环、HTTP/1.1 keepalive、128 字节响应、`AsyncSession` 单会话，同一台机器上 0.3.0 与 0.3.1 的 A/B
+（每格重复 5 次全部通过才计入）：
+
+| 并发 | 0.3.0 | 0.3.1 | 变化 |
+| ---: | ---: | ---: | ---: |
+| 1 | 3,590 req/s | 3,451 req/s | −4% |
+| 128 | 3,689 req/s | **7,102 req/s** | **+93%** |
+| 512 | 2,355 req/s | **7,133 req/s** | **+203%** |
+
+并发 512 时，每成功请求的客户端 CPU 从 0.44 ms 降到 0.14 ms，p95 从 239 ms 降到 92 ms。
+同一批测量里与 curl_cffi 对比：并发 32～512 高 15%～24%，64 KB 大响应体高 36%，
+每次新建连接的场景高 43%；低并发（1）基本持平。
+
 ### 性能实测
 
-下面是横向评测里的几张原始图（客户端与服务端同机回环、各自绑核，每一格都是实测）：
+下面是横向评测里的几张原始图（客户端与服务端同机回环、各自绑核，每一格都是实测；
+这份六库横向对比跑于 0.3.0 时期，0.3.1 异步重构的数据见上表）：
 
 **吞吐随并发的变化** —— 明文 HTTP/1.1，128 字节响应；低并发段看单连接开销，高并发段看调度成本。
 
@@ -102,7 +118,7 @@ HTTP/2 指纹与请求头等维度扣分。同一台机器、同一个检测站�
 import nb_curl
 
 # 一次性请求
-r = nb_curl.get("https://www.xcctls.top/all", impersonate="chrome152", timeout=15)
+r = nb_curl.get("https://www.xcctls.top/all", impersonate="chrome155", timeout=15)
 r.status_code          # 200
 r.json()               # dict
 r.http_version         # "2"
@@ -122,13 +138,13 @@ import nb_curl
 
 async def main():
     # 推荐：with 会自动关闭
-    async with nb_curl.AsyncSession(impersonate="chrome152", max_clients=20) as s:
+    async with nb_curl.AsyncSession(impersonate="chrome155", max_clients=20) as s:
         r = await s.get("https://example.com")
         print(r.status_code)
         rs = await asyncio.gather(*[s.get(u) for u in urls])    # 并发
 
     # 不想用 with，就自己收尾 —— close() 是 async 方法，要 await
-    s = nb_curl.AsyncSession(impersonate="chrome152", max_clients=20)
+    s = nb_curl.AsyncSession(impersonate="chrome155", max_clients=20)
     try:
         r = await s.get("https://example.com")
     finally:
@@ -223,7 +239,7 @@ Chrome 系导航请求默认带（HEADERS flags `0x25`），需要「不带」�
 
 | 家族 | 预设 |
 | --- | --- |
-| **Chrome** | `chrome99` · `chrome99_android` · `chrome100` · `chrome101` · `chrome104` · `chrome107` · `chrome110` · `chrome116` · `chrome119` · `chrome120` · `chrome123` · `chrome124` · `chrome131` · `chrome131_android` · `chrome133a` · `chrome136` · `chrome142` · `chrome145` · `chrome146` · `chrome150` · `chrome152` |
+| **Chrome** | `chrome99` · `chrome99_android` · `chrome100` · `chrome101` · `chrome104` · `chrome107` · `chrome110` · `chrome116` · `chrome119` · `chrome120` · `chrome123` · `chrome124` · `chrome131` · `chrome131_android` · `chrome133a` · `chrome136` · `chrome142` · `chrome145` · `chrome146` · `chrome150` · `chrome155` |
 | **Edge** | `edge99` · `edge101` |
 | **Firefox** | `firefox133` · `firefox135` · `firefox144` · `firefox147` |
 | **Safari** | `safari153` · `safari155` · `safari170` · `safari172_ios` · `safari180` · `safari180_ios` · `safari184` · `safari184_ios` · `safari260` · `safari2601` · `safari260_ios` |
@@ -235,7 +251,7 @@ Chrome 系导航请求默认带（HEADERS flags `0x25`），需要「不带」�
 给预设加 `:no` 后缀，可以只套 TLS/H2 指纹、**不带**该浏览器的默认请求头：
 
 ```python
-nb_curl.get(url, impersonate="chrome152:no")
+nb_curl.get(url, impersonate="chrome155:no")
 ```
 
 运行期想确认本机有哪些可用：
@@ -290,32 +306,54 @@ nb_curl.get(url, impersonate="chrome150", diy_fp={
 
 可用键见 `nb_curl.diy_fp_fields()`，拼错会直接报错，不会静默忽略。
 
-#### `trust_anchors`（扩展 51764）—— 内置预设已带，通常不用管
+#### `header_order` —— 自定义请求头顺序（host 永远在最前）
 
-Chrome 152 的 ClientHello 多了一个 `trust_anchors(51764)` 扩展，载荷是 Chrome 内置
-根存储里每张根证书的编号。**`chrome152` 预设默认就发这 28 项**，你什么都不用配；
-只有要换一份时才写：
+`diy_fp={"header_order": ...}` 决定**普通请求头**的发送顺序，字符串和列表两种写法都行
+（列表更方便，不用自己拼逗号）：
+
+```python
+# 列表写法
+nb_curl.get(url, impersonate="chrome155", diy_fp={
+    "header_order": ["sec-ch-ua", "user-agent", "accept"]})
+
+# 字符串写法等价
+nb_curl.get(url, impersonate="chrome155", diy_fp={
+    "header_order": "sec-ch-ua,user-agent,accept"})
+```
+
+规则（HTTP/1.1 与 HTTP/2 都生效）：
+
+* 名单里的头**按你给的顺序**排到最前，没列出的头保持原相对顺序追加在后；
+* **`host` 永远排第一个**：名单里没写会自动补在最前，写在别处会被提上来
+  （不这样做的话 `host` 会掉进"其余"那组，跑到末尾）；
+* 头名大小写不敏感，重复项只保留一份。
+
+> 注意：名单里的头必须**真的在请求里存在**才有意义（`header_order` 只负责排序，
+> 不会凭空造出一个头）。要让某个头出现在指定位置，请同时用 `headers=` 传它。
+
+#### `trust_anchors`（扩展 51764）—— 内置预设已带，也能单独换
+
+Chrome 的 ClientHello 多了一个 `trust_anchors(51764)` 扩展，载荷是 Chrome 内置根存储里
+每张根证书的编号。**`chrome155` 预设默认就发这 28 项**（顺序与真 Chrome 155 逐字节相同），
+你什么都不用配；要换一份时，和 `tls_signature_algorithms` 一样走 `diy_fp` 单独给：
 
 ```python
 # 默认：自带 Chrome 的 28 项
-nb_curl.get(url, impersonate="chrome152")
+nb_curl.get(url, impersonate="chrome155")
 
-# 换成自己的列表（逗号分隔的十进制点分 OID）
-nb_curl.get(url, impersonate="chrome152",
+# 换成自己的列表（逗号分隔的十进制点分 OID），按你给的顺序原样发出
+nb_curl.get(url, impersonate="chrome155",
             diy_fp={"tls_trust_anchors": "52580.200109.1.10,11129.9.1"})
 
 # 显式发空列表（线格式 "0000"，和"扩展不存在"不是一回事）
-nb_curl.get(url, impersonate="chrome152",
+nb_curl.get(url, impersonate="chrome155",
             diy_fp={"tls_trust_anchors": ""})
 ```
 
-排列在**单次进程内固定**、换进程才可能变 —— 与真实 Chrome 一致（一次运行内几十条
-连接字节全同）。想确认线上到底发了什么，跑仓库里的离线示例
-（用"只收不答"的本地监听截下第一条 ClientHello 再解扩展表）：
-
-```bash
-python examples/trust_anchors_demo.py
-```
+显式给的列表**整份替换**预设那份（不是追加），顺序也由你决定：真 Chrome 是按
+RELATIVE-OID 编码字节排序后固定发出的，同一版本每次连接 186 字节全同 —— 本库同样
+不重排、不洗牌。想确认线上到底发了什么，用一个"只收不答"的本地监听截下第一条
+ClientHello，再解 51764 的载荷即可（`nb_curl.tls.TLS_EXTENSIONS[51764]` 就是这个扩展）。
 
 #### `fp_file` —— 一键复刻真实浏览器（最省事）
 
@@ -341,7 +379,7 @@ nb_curl.get(url, impersonate=fp)
 `fp_file` 和 `impersonate` 可以叠加：**快照打底，显式参数覆盖**。
 
 ```python
-nb_curl.get(url, fp_file="real_chrome.json", impersonate="chrome152")
+nb_curl.get(url, fp_file="real_chrome.json", impersonate="chrome155")
 ```
 
 想换浏览器？在浏览器里重新打开一次 `/all`、存成新 JSON 就行。
@@ -378,7 +416,7 @@ nb_curl.get(url, diy_fp={"tls_cert_compression": "lz4"})
 ```python
 # http_version 的字符串写法与数字写法完全等价，填哪一种都行：
 #   "1.0" = 10    "1.1" = 11    "2" = 20    "2.0" = 20    "3" = 30    "3.0" = 30
-r = nb_curl.get("https://h3.xcctls.top/h3_data", impersonate="chrome152", http_version="3")
+r = nb_curl.get("https://h3.xcctls.top/h3_data", impersonate="chrome155", http_version="3")
 print(r.status_code, r.http_version)      # 200 3
 ```
 

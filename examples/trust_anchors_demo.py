@@ -4,15 +4,16 @@
 
 背景（30 秒版）
 ===============
-Chrome 152 的 ClientHello 里多了一个扩展开关 51764 ``trust_anchors``，载荷是
+Chrome 的 ClientHello 里有一个扩展开关 51764 ``trust_anchors``，载荷是
 一串「信任锚 ID」（Chrome 内置根存储里每张根证书的编号）。JA3/JA4 里表现为
 扩展列表末尾多一个 ``51764``，所以会被部分检测站当成"新版 Chrome 的特征"。
 
-* 内置预设 ``chrome152`` **默认就会发**这 28 项，你什么都不用配；
+* 内置预设 ``chrome155`` **默认就会发**这 28 项，你什么都不用配；
 * 想换一份（比如你抓到了某个特定版本 Chrome 的列表），用
   ``diy_fp={"tls_trust_anchors": "..."}`` 覆盖；
-* 顺序：单次进程内 28 项排列是固定的，**每次新起的进程才可能换一个排列** ——
-  跟真实 Chrome 一样（一次运行内几十条连接收到的顺序完全一致，换一次运行才变）。
+* 顺序：**按你给的顺序原样发出，不做任何重排**。真 Chrome（155）把这 28 项按
+  RELATIVE-OID 编码字节排序后固定发送 —— 每一条连接、每一次浏览器启动，收到的
+  都是同一份 186 字节；内置预设存的就是这份序。
 
 先跑起来
 ========
@@ -38,7 +39,7 @@ if os.path.isdir(os.path.join(_ROOT, "nb_curl")):
 
 import nb_curl  # noqa: E402
 
-# Chrome 内置根存储的 28 项 trust anchor ID（从真实 Chrome 152 抓包解出）。
+# Chrome 内置根存储的 28 项 trust anchor ID（从真实 Chrome 155 抓包解出，与内置预设 ``chrome155`` 同一份）。
 CHROME_ANCHORS = (
     "52580.200109.1.10", "44947.2.1", "52580.200109.1.7", "11129.9.11",
     "44947.2.6", "11129.9.5", "11129.9.10", "44947.2.18",
@@ -175,29 +176,29 @@ def show(title: str, exts: dict[int, bytes]) -> list[str]:
 def main() -> int:
     print("\nnb_curl %s  backend=%s\n" % (nb_curl.__version__, nb_curl.backend_name()))
 
-    # --- 1. 默认：chrome152 自带 Chrome 的 28 项，什么都不用配 ---
+    # --- 1. 默认：chrome155 自带 Chrome 的 28 项，什么都不用配 ---
     default_anchors = show(
-        "1) 默认 chrome152（不传 diy_fp）",
-        sniff_client_hello(impersonate="chrome152"))
+        "1) 默认 chrome155（不传 diy_fp）",
+        sniff_client_hello(impersonate="chrome155"))
 
     # --- 2. 自定义：只发你指定的两条 ---
     custom = "52580.200109.1.10,11129.9.1"
     custom_anchors = show(
         "2) diy_fp={'tls_trust_anchors': %r}" % custom,
-        sniff_client_hello(impersonate="chrome152",
+        sniff_client_hello(impersonate="chrome155",
                            diy_fp={"tls_trust_anchors": custom}))
 
     # --- 3. 显式发空列表（线格式 0000）---
     show("3) diy_fp={'tls_trust_anchors': ''}   # 发空列表",
-         sniff_client_hello(impersonate="chrome152",
+         sniff_client_hello(impersonate="chrome155",
                             diy_fp={"tls_trust_anchors": ""}))
 
-    # --- 4. 同一进程内连发两次：排列应当完全一致 ---
-    again = sniff_client_hello(impersonate="chrome152")
+    # --- 4. 同一进程内连发两次：顺序应当逐项相同（跨进程也不变）---
+    again = sniff_client_hello(impersonate="chrome155")
     same = (_decode_trust_anchors(again[TA_EXTENSION_ID]) == default_anchors)
     print("=" * 72)
-    print("4) 同一进程内第二次连接的排列是否与第一次完全相同: %s" % ("是" if same else "否"))
-    print("   真实 Chrome 就是这样：一次运行内几十条连接字节全同，换运行才变。")
+    print("4) 同一进程内第二次连接是否与第一次逐项相同: %s" % ("是" if same else "否"))
+    print("   真实 Chrome 也是这样：每连接同一份字节，换一次启动也还是同一份。")
     print()
 
     # --- 5. 一份"从别处抓来的列表"怎么喂进来 ---
@@ -206,7 +207,7 @@ def main() -> int:
     #
     #         from nb_curl.xcctls import _decode_trust_anchors
     #         oids = _decode_trust_anchors("00b804d67909040582df1302...")
-    #         Session(impersonate="chrome152",
+    #         Session(impersonate="chrome155",
     #                 diy_fp={"tls_trust_anchors": oids})
     #
     #     手里只有一份 xcctls /all 快照 JSON 时更省事：
@@ -220,7 +221,8 @@ def main() -> int:
     print("=" * 72)
     print("小结")
     print("=" * 72)
-    print("  默认                 : chrome152 已带 Chrome 28 项，无需配置")
+    print("  默认                 : chrome155 已带 Chrome 28 项，无需配置")
+    print("  顺序                 : 原样发出、不重排（预设 = 真 Chrome 155 的顺序）")
     print("  换一份               : diy_fp={'tls_trust_anchors': 'OID, OID, ...'}")
     print("  发空列表             : diy_fp={'tls_trust_anchors': ''}")
     print("  字段类型/说明         : nb_curl.diy_fp_fields()['tls_trust_anchors']")

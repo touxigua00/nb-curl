@@ -1,5 +1,8 @@
 > **关于这份文件**：这是 [`report.html`](report.html) 的 Markdown 版 —— GitHub 会直接渲染 Markdown 和图片，所以在这里能当场看到全部图表。
 >
+> **数据版本**：本报告是 **0.3.0 时期**跑的同机横向评测（六个库对比），图表与数字都没有随 `0.3.1`
+> 重跑；`0.3.1` 执行层重写后的异步吞吐数据见根目录 README 的「模拟能力与性能」一节。
+>
 > 想要一个独立页面（带完整样式、可离线打开、方便分享）用 `report.html`：[在线预览](https://htmlpreview.github.io/?https://github.com/touxigua00/nb-curl/blob/main/benchmarks/report.html) · [源文件](report.html)。
 >
 > 下面是同一份报告的内容，数字与报告完全一致。
