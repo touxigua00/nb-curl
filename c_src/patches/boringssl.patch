@@ -1505,3 +1505,26 @@ index f9ba6a9b6..29614c3b7 100644
  // Test that, when extension permutation is enabled, the ClientHello extension
  // order changes, both with and without ECH, and in both ClientHelloInner and
  // ClientHelloOuter.
+diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
+--- a/ssl/handshake_client.cc
++++ b/ssl/handshake_client.cc
+@@ -150,7 +150,8 @@
+     // printf("CIPHER ORDER IS %s\n", order);
+ 
+     // This may seem silly at the first sight, but it's actually faster and easier.
+-    const bssl::Span<const uint16_t> ciphers =
++    // (MSVC: ternary chains decay arrays to pointers, so build the Span explicitly.)
++    const uint16_t *ciphers_ptr =
+       order == nullptr ?
+         kCiphersAESHardware :
+         strncmp(order, "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256", TLS13_CIPHER_LEN) == 0 ?
+@@ -167,6 +168,9 @@
+           kCiphersOther :
+           kCiphersAESHardware;  // default one
+ 
++    const bssl::Span<const uint16_t> ciphers =
++        bssl::MakeSpan(ciphers_ptr, 3);
++
+     for (auto cipher : ciphers) {
+       if (!ssl_add_tls13_cipher(&child, cipher,
+                                 ssl->config->compliance_policy)) {
