@@ -20,85 +20,29 @@ import sys
 #     相对路径（已实测），导致 cl.exe 找不到；
 #   * cmd.exe 在本环境被安全策略拦截。
 # 所以直接在 Python 里用**原生 Windows 路径**写 os.environ，绕开所有 shell 改写。
-#
-# 所有路径都可以用环境变量覆盖，默认值按"仓库自带的 deps/windows-prebuilt/"
-# 和"标准的 Visual Studio 安装位置"推导，因此换一台机器不需要改本文件：
-#
-#   NB_CURL_MSVC_TOOLS  MSVC 工具链目录（.../VC/Tools/MSVC）
-#   NB_CURL_SDK_ROOT    Windows SDK 根目录
-#   NB_CURL_SDK_VER     Windows SDK 版本（留空则自动取最新的）
-#   NB_CURL_BORINGSSL   含 include/ + lib/ 的 BoringSSL 安装树
-#   NB_CURL_LIBCURL     含 include/ + lib/libcurl-impersonate.lib 的 libcurl 安装树
-#   NB_CURL_VCPKG       含 include/ + lib/*.lib 的第三方静态库树
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # <repo>/python
-_REPO = os.path.dirname(_ROOT)                                       # <repo>
-_PREBUILT = os.path.join(_REPO, "deps", "windows-prebuilt")
+_MSVC_TOOLS = os.environ.get(
+    "NB_CURL_MSVC_TOOLS",
+    r"D:\Program_files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC")
+_SDK_ROOT = os.environ.get("NB_CURL_SDK_ROOT", r"C:\Program Files (x86)\Windows Kits\10")
+_SDK_VER = os.environ.get("NB_CURL_SDK_VER", "10.0.26100.0")
 
-_MSVC_TOOLS = os.environ.get("NB_CURL_MSVC_TOOLS") or ""
-_SDK_ROOT = os.environ.get("NB_CURL_SDK_ROOT") or r"C:\Program Files (x86)\Windows Kits\10"
-_SDK_VER = os.environ.get("NB_CURL_SDK_VER") or ""
-_BSSL = os.environ.get("NB_CURL_BORINGSSL") or os.path.join(_PREBUILT, "boringssl")
-_CURLDIR = os.environ.get("NB_CURL_LIBCURL") or os.path.join(_PREBUILT, "curl-impersonate")
-_VCPKG = os.environ.get("NB_CURL_VCPKG") or os.path.join(_PREBUILT, "vcpkg-static")
-
-
-def _detect_msvc_tools() -> str:
-    """定位 .../VC/Tools/MSVC 目录，优先用 vswhere，其次扫常见安装位置。"""
-    if _MSVC_TOOLS and os.path.isdir(_MSVC_TOOLS):
-        return _MSVC_TOOLS
-    vswhere = os.path.join(
-        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-        "Microsoft Visual Studio", "Installer", "vswhere.exe")
-    if os.path.isfile(vswhere):
-        try:
-            import subprocess
-
-            out = subprocess.check_output(
-                [vswhere, "-latest", "-products", "*", "-property", "installationPath"],
-                text=True, stderr=subprocess.DEVNULL).strip().splitlines()
-            if out:
-                cand = os.path.join(out[0].strip(), "VC", "Tools", "MSVC")
-                if os.path.isdir(cand):
-                    return cand
-        except Exception:
-            pass
-    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"),
-                 r"D:\Program_files"):
-        if not base:
-            continue
-        for edn in ("Community", "Professional", "Enterprise", "BuildTools"):
-            cand = os.path.join(base, "Microsoft Visual Studio", "2022", edn,
-                                "VC", "Tools", "MSVC")
-            if os.path.isdir(cand):
-                return cand
-    return _MSVC_TOOLS or r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC"
-
-
-def _detect_sdk_ver() -> str:
-    """未显式指定 SDK 版本时，取 Windows Kits/10/Include 下最新的一个。"""
-    if _SDK_VER:
-        return _SDK_VER
-    inc = os.path.join(_SDK_ROOT, "Include")
-    if os.path.isdir(inc):
-        vers = [d for d in os.listdir(inc)
-                if d[:2].isdigit() and os.path.isdir(os.path.join(inc, d))]
-        if vers:
-            return sorted(vers)[-1]
-    return "10.0.26100.0"
+# 预编译依赖也从仓库推导（deps/windows-prebuilt/ 下四套）；环境变量可覆盖。
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_PREBUILT = os.environ.get(
+    "NB_CURL_PREBUILT", os.path.join(_REPO, "deps", "windows-prebuilt"))
+_BSSL = os.path.join(_PREBUILT, "boringssl")
+_VCPKG = os.path.join(_PREBUILT, "vcpkg-static")
+_CURLDIR = os.path.join(_PREBUILT, "curl-impersonate")
 
 
 def _latest_msvc() -> str:
-    tools = _detect_msvc_tools()
-    if not os.path.isdir(tools):
-        raise SystemExit(
-            "找不到 MSVC 工具链目录: %s\n"
-            "请安装 Visual Studio 2022（含 C++ 生成工具），或用环境变量 "
-            "NB_CURL_MSVC_TOOLS 指定 .../VC/Tools/MSVC 的路径。" % tools)
+    if not os.path.isdir(_MSVC_TOOLS):
+        raise SystemExit("找不到 MSVC 工具链目录: %s" % _MSVC_TOOLS)
     versions = sorted(
-        (d for d in os.listdir(tools) if os.path.isdir(os.path.join(tools, d))),
+        (d for d in os.listdir(_MSVC_TOOLS) if os.path.isdir(os.path.join(_MSVC_TOOLS, d))),
         key=lambda s: tuple(int(x) for x in s.split(".") if x.isdigit()),
     )
-    return os.path.join(tools, versions[-1])
+    return os.path.join(_MSVC_TOOLS, versions[-1])
 
 
 def setup_msvc_env() -> None:
@@ -106,9 +50,8 @@ def setup_msvc_env() -> None:
     if os.name != "nt":
         return
     msvc = _latest_msvc()
-    sdk_ver = _detect_sdk_ver()
-    sdk_inc = os.path.join(_SDK_ROOT, "Include", sdk_ver)
-    sdk_lib = os.path.join(_SDK_ROOT, "Lib", sdk_ver)
+    sdk_inc = os.path.join(_SDK_ROOT, "Include", _SDK_VER)
+    sdk_lib = os.path.join(_SDK_ROOT, "Lib", _SDK_VER)
 
     include_parts = [
         os.path.join(msvc, "include"),
@@ -133,7 +76,7 @@ def setup_msvc_env() -> None:
 
     bin_parts = [
         os.path.join(msvc, "bin", "Hostx64", "x64"),
-        os.path.join(_SDK_ROOT, "bin", sdk_ver, "x64"),
+        os.path.join(_SDK_ROOT, "bin", _SDK_VER, "x64"),
     ]
     os.environ["PATH"] = ";".join(bin_parts) + ";" + os.environ.get("PATH", "")
 
@@ -253,6 +196,36 @@ CDEF = r"""
 
     const char* easy_version(void);
     const char* easy_strerror(int code);
+
+    /* ---- 阶段 2：multi 驱动 + 结果所有权移交 ---- */
+    typedef void nb_multi;
+    typedef struct { long long fd; int action; int _reserved; } nb_sock_info;
+    typedef struct { long long fd; int events; int revents; } nb_poll_item;
+
+    int nb_multi_abi_version(void);
+    nb_multi* nb_multi_init(void);
+    void nb_multi_cleanup(nb_multi* m);
+    int nb_multi_add(nb_multi* m, void* e);
+    int nb_multi_remove(nb_multi* m, void* e);
+    int nb_multi_active(nb_multi* m);
+
+    int easy_prepare_request(void* e);
+    int easy_take_body(void* e, char** out, size_t* len);
+    int easy_take_headers(void* e, char** out, size_t* len);
+    int easy_pause(void* e, int bitmask);
+    int easy_perform_take(void* e, int* status_code, char** body, size_t* body_len,
+                          char** headers, size_t* headers_len, char** error_msg);
+
+    int nb_multi_perform(nb_multi* m);
+    int nb_multi_drain(nb_multi* m, int* msg, int* code, void** easy_out);
+    int nb_multi_socket_action(nb_multi* m, long long fd, int ev_bitmask);
+    int nb_multi_socket_snapshot(nb_multi* m, nb_sock_info* out, int cap, int* total);
+    int nb_multi_socket_changes(nb_multi* m, nb_sock_info* out, int cap, int* total);
+    int nb_multi_timer(nb_multi* m, long* out_ms);
+    int nb_multi_fire_timer(nb_multi* m);
+    int nb_multi_poll(nb_multi* m, long timeout_ms, int* out_numfds);
+    int nb_multi_wakeup(nb_multi* m);
+    int nb_poll_sockets(nb_poll_item* items, int count, long timeout_ms);
 """
 
 
@@ -340,16 +313,23 @@ def build(verbose: bool = True) -> str:
     root = os.path.dirname(here)
     build_dir = os.path.join(root, "build")
     lib_dir = os.path.join(here, "_lib")
+    # 导入库（nb_curl_native.lib）所在目录：默认 <项目根>/build，
+    # 可用 NB_CURL_IMPLIB_DIR 指向实际产出目录（本项目构建脚本产出在 build/native/）。
+    implib_dir = os.environ.get("NB_CURL_IMPLIB_DIR") or build_dir
 
     is_win = os.name == "nt"
     extra_link_args: list[str] = []
     library_dirs = [lib_dir]
 
     if is_win:
-        if not os.path.isfile(os.path.join(build_dir, "nb_curl_native.lib")):
+        # /Brepro：不写 PE 时间戳，保证同样源码/工具链产出逐字节相同的扩展
+        # （基准对比要记录二进制哈希，不可复现就没法证明"测的是同一份产物"）。
+        extra_link_args.append("/Brepro")
+        implib = os.path.join(implib_dir, "nb_curl_native.lib")
+        if not os.path.isfile(implib):
             raise SystemExit(
-                "缺少导入库 build/nb_curl_native.lib，请先运行 build_native.sh")
-        library_dirs.insert(0, build_dir)
+                "缺少导入库 %s，请先运行 build/build_windows_bridge.ps1" % implib)
+        library_dirs.insert(0, implib_dir)
     else:
         if not os.path.isfile(os.path.join(lib_dir, "libnb_curl_native.so")):
             raise SystemExit(
@@ -395,6 +375,25 @@ def build(verbose: bool = True) -> str:
 
     if not os.path.isfile(out):
         raise SystemExit("CFFI 扩展产物缺失：%s" % out)
+
+    # 落位后再做一次运行期自检：新扩展必须能看到 multi ABI v3，否则说明它链接到了
+    # 旧的导入库（构建静默错位，不如在这里直接失败）。
+    # 模块名必须与编译时的名字一致：扩展的 PyInit 函数名由模块名决定。
+    import importlib.util
+
+    if "nb_curl._nb_curl_cffi" in sys.modules:
+        print("  [..] 当前进程已加载 _nb_curl_cffi，跳过 ABI 探针")
+    else:
+        spec = importlib.util.spec_from_file_location("nb_curl._nb_curl_cffi", out)
+        probe = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(probe)  # type: ignore[union-attr]
+        ver = probe.lib.nb_multi_abi_version()
+        if ver != 3:
+            raise SystemExit(
+                "编译产物里的 nb_multi_abi_version()=%r，期望 3 —— 可能链接到了旧的"
+                " nb_curl_native.lib。请先重建桥接层"
+                "（build/build_windows_bridge.sh）。" % (ver,))
+        print("  multi ABI 版本自检通过:", ver)
 
     print("NB_CURL-CFFI-BUILD-OK ->", out)
     return out

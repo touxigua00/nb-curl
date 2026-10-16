@@ -23,7 +23,7 @@ bash build/linux/scripts/build_all.sh
 
 ```bash
 bash build/linux/scripts/90_test.sh                          # 跑测试
-pip install python/dist/nb_curl-0.1.0-py3-none-linux_x86_64.whl # 安装
+pip install python/dist/nb_curl-0.3.1-py3-none-linux_x86_64.whl # 安装
 ```
 
 耗时参考（2 核 / 4GB 虚拟机）：**约 10–15 分钟**，其中 BoringSSL 编译占大头。
@@ -36,7 +36,7 @@ pip install python/dist/nb_curl-0.1.0-py3-none-linux_x86_64.whl # 安装
 | --- | --- | --- |
 | native 桥接层 | `python/nb_curl/_lib/libnb_curl_native.so` | 静态链接 libcurl-impersonate + BoringSSL，28MB |
 | CFFI 扩展 | `python/nb_curl/_nb_curl_cffi.cpython-3XX-x86_64-linux-gnu.so` | CFFI API 模式，可选 |
-| wheel | `python/dist/nb_curl-0.1.0-py3-none-linux_x86_64.whl` | 可直接 pip install |
+| wheel | `python/dist/nb_curl-0.3.1-py3-none-linux_x86_64.whl` | 可直接 pip install |
 
 ---
 
@@ -116,7 +116,7 @@ NB_CURL_JOBS=8 bash build/linux/scripts/build_all.sh  # 指定并行度
 | 文件 | 内容 |
 | --- | --- |
 | `boringssl-patched.tar.gz` (75MB) | BoringSSL@156c7b75，`ssl.h` 里含 extension order / GREASE / ALPS / ECH 等钩子 |
-| `curl-8.22.0-patched.tar.gz` (3.9MB) | curl 8.22.0，含 `lib/impersonate.c`（39 套内置浏览器指纹）与 `CURLOPT_IMPERSONATE` 等新选项 |
+| `curl-8.22.0-patched.tar.gz` (3.9MB) | curl 8.22.0，含 `lib/impersonate.c`（40 套内置浏览器指纹）与 `CURLOPT_IMPERSONATE` 等新选项 |
 
 **不要换成上游原始源码**，否则 `CURLOPT_TLS_EXTENSION_ORDER` 之类会编译失败。
 脚本里有 `grep` 校验，用错包会直接报错退出。
@@ -237,7 +237,7 @@ Ubuntu 22.04+ / Debian 12+ / RHEL 9+ 都能用。
 ### 方式 A：装 wheel（推荐）
 
 ```bash
-pip install python/dist/nb_curl-0.1.0-py3-none-linux_x86_64.whl
+pip install python/dist/nb_curl-0.3.1-py3-none-linux_x86_64.whl
 ```
 
 ### 方式 B：直接从源码目录装

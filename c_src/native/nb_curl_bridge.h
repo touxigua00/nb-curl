@@ -191,8 +191,9 @@ NB_API int NB_CALL easy_set_option_off(nb_easy* e, int option, long long value);
 /* ------------------------------------------------------------------ */
 /* 连接建立：调用方先 _curl_easy_setopt(handle, CURLOPT_CONNECT_ONLY=141, &2L)
  *           再调 easy_perform 完成 ws 握手；之后用下面两个函数收发帧。
- * 帧 flags（与 curl 的 CURLWS_* 一致）：
- *   TEXT=1  BINARY=2  CONT=4  CLOSE=8  PING=0x10  PONG=0x20 */
+ * 帧 flags（与 curl 的 CURLWS_* 一致，见 curl/websockets.h）：
+ *   TEXT=1  BINARY=2  CONT=4  CLOSE=8  PING=0x10
+ *   OFFSET=0x20（recv 元数据位，不是帧类型）  PONG=0x40（send 位） */
 /* 发送一帧。整帧一次性写入；返回 CURLcode，部分发送返回 -3（调用方重发整帧）。 */
 NB_API int NB_CALL easy_ws_send(nb_easy* e, const char* buf, int len, int flags);
 /* 接收一帧片段。无数据时返回 CURLE_AGAIN(81)。
@@ -222,6 +223,121 @@ NB_API int NB_CALL easy_getinfo_string(nb_easy* e, int info, const char** out);
 
 NB_API const char* NB_CALL easy_version(void);
 NB_API const char* NB_CALL easy_strerror(int code);
+
+/* ================================================================== */
+/* 阶段 2 新增：multi 驱动 + 结果所有权移交（固定签名，无变参）        */
+/* ================================================================== */
+/*
+ * 语义约定（谁在什么时候能调）：
+ *   - 一个 nb_multi 与放进它的每个 nb_easy 都有**唯一所有者线程**；
+ *     除 nb_multi_wakeup 外，其余函数都不允许跨线程并发调用。
+ *   - 传输完成：先 nb_multi_drain 读出完成消息（含 CURLcode）并保存，
+ *     再 nb_multi_remove，然后才能读结果 / 释放 handle。
+ *   - 取消：同样先 nb_multi_remove 再释放；同一次传输只能收尾一次。
+ *   - socket/timer 回调在 nb_multi_init 时一次性挂好，生命周期与 nb_multi 相同，
+ *     调用方不需要（也不能）保活任何 Python 对象。
+ *   - timer 回调里**不允许**递归调用 socket_action：timeout_ms == 0 时桥接层只置
+ *     "待触发"标志，由调用方在本轮 socket_action 返回后调 nb_multi_fire_timer。
+ *   - 致命错误（drive 返回负 CURLMcode、socket 回调里 fd 表扩容失败等）会把整个
+ *     multi 置为 broken：此后所有 nb_multi_* 返回负值（-2），调用方必须丢弃**这个
+ *     multi**（并失败它名下所有在飞传输），不能当成"只有某一个请求失败"。
+ */
+
+/* 本次编译的 multi ABI 版本；Python 侧据此确认新老 DLL 是否配套（应为 3）。 */
+NB_API int NB_CALL nb_multi_abi_version(void);
+
+/* ---------------- 事件位（与 libcurl / asyncio 的映射由 Python 侧做） ------------- */
+#define NB_CSELECT_IN   1
+#define NB_CSELECT_OUT  2
+#define NB_CSELECT_ERR  4
+
+/* pause 位（与 libcurl 的 CURLPAUSE_* 数值一致） */
+#define NB_PAUSE_RECV   1
+#define NB_PAUSE_SEND   4
+#define NB_PAUSE_ALL    5
+#define NB_PAUSE_CONT   0
+
+/* socket 快照条目：fd 为 curl_socket_t 的数值形式；action 为 CURL_POLL_* */
+typedef struct {
+    long long fd;
+    int       action;
+    int       _reserved;
+} nb_sock_info;
+
+/* poll 条目：调用方填 fd/events（NB_CSELECT_* 位），返回时 revents 为就绪位 */
+typedef struct {
+    long long fd;
+    int       events;
+    int       revents;
+} nb_poll_item;
+
+/* 不透明 multi 句柄 */
+typedef void nb_multi;
+
+/* ---------------- multi 生命周期 ------------------------------------------------ */
+NB_API nb_multi* NB_CALL nb_multi_init(void);
+/* 释放 multi。仍在 multi 里的句柄**不会**被 cleanup 释放，调用方必须先 remove。 */
+NB_API void NB_CALL nb_multi_cleanup(nb_multi* m);
+
+NB_API int NB_CALL nb_multi_add(nb_multi* m, nb_easy* e);
+NB_API int NB_CALL nb_multi_remove(nb_multi* m, nb_easy* e);
+/* 当前还在 multi 里的 transfers 数（curl 的 running_handles） */
+NB_API int NB_CALL nb_multi_active(nb_multi* m);
+
+/* ---------------- 请求准备与结果移交 ------------------------------------------- */
+/* 把已记录的 method/body 落到 handle 上并清空结果缓冲。
+   **必须在 nb_multi_add 之前调用**（multi 路径不走 easy_perform）。 */
+NB_API int NB_CALL easy_prepare_request(nb_easy* e);
+/* 结果所有权移交：把 C 累积缓冲直接交给调用方（不再 strdup 整体正文）。
+   handle 内缓冲被置空；调用方用 easy_free_string 释放。len 可为 NULL。 */
+NB_API int NB_CALL easy_take_body(nb_easy* e, char** out, size_t* len);
+NB_API int NB_CALL easy_take_headers(nb_easy* e, char** out, size_t* len);
+/* 暂停/继续：bitmask 见 NB_PAUSE_*；返回 CURLcode。 */
+NB_API int NB_CALL easy_pause(nb_easy* e, int bitmask);
+
+/* easy_perform 的零额外复制版本：与 easy_perform 同签名，
+   唯一区别是 body/headers 直接移交 C 累积缓冲（少一次整块 memcpy）。 */
+NB_API int NB_CALL easy_perform_take(nb_easy* e, int* status_code,
+                                     char** body, size_t* body_len,
+                                     char** headers, size_t* headers_len,
+                                     char** error_msg);
+
+/* ---------------- 非阻塞推进 / 完成队列 ---------------------------------------- */
+/* 等价 curl_multi_perform；返回活跃传输数，或负的 CURLMcode。 */
+NB_API int NB_CALL nb_multi_perform(nb_multi* m);
+/* 完成队列排空：一次取一条。返回 1 = 取到、0 = 空、<0 = 错误。
+   msg 为 CURLMSG_*；code 为该传输的 CURLcode；easy_out 为对应句柄。 */
+NB_API int NB_CALL nb_multi_drain(nb_multi* m, int* msg, int* code, nb_easy** easy_out);
+
+/* ---------------- socket-action 驱动 ------------------------------------------- */
+/* ev_bitmask 为 NB_CSELECT_* 组合；返回活跃传输数或负 CURLMcode。 */
+NB_API int NB_CALL nb_multi_socket_action(nb_multi* m, long long fd, int ev_bitmask);
+/* 导出当前登记的 socket 表：out 可传 NULL 只问数量。
+   返回写入条数（<0 为错误）；total 出参给总条数，调用方据此扩容。 */
+NB_API int NB_CALL nb_multi_socket_snapshot(nb_multi* m, nb_sock_info* out,
+                                            int cap, int* total);
+/* 按序消费 socket 变更（action 为 CURL_POLL_*，REMOVE=4）。
+   out 为 NULL 或 cap 不足时仅设置 total，不消费、返回 0；容量足够时返回条数并清空。
+   snapshot 不影响此队列；broken 返回 -2。 */
+NB_API int NB_CALL nb_multi_socket_changes(nb_multi* m, nb_sock_info* out,
+                                           int cap, int* total);
+/* 剩余定时器毫秒数，以**调用时刻**为基准现算（curl_multi_timeout）：
+   0 = 已到期该立刻推进，-1 = 当前没有定时器。
+   返回 0 成功，负值为 CURLMcode（multi 已标 broken）。 */
+NB_API int NB_CALL nb_multi_timer(nb_multi* m, long* out_ms);
+/* 触发一次超时处理（等价 socket_action(fd=超时, 0)）。 */
+NB_API int NB_CALL nb_multi_fire_timer(nb_multi* m);
+
+/* ---------------- 阻塞等待（Windows 有界专职驱动 / 通用兜底） ------------------ */
+/* 单调 millisecond 超时；timeout_ms 必须非负（负值按 0 处理，不做无界等待）。
+   返回就绪 socket 数，或负的 CURLMcode。 */
+NB_API int NB_CALL nb_multi_poll(nb_multi* m, long timeout_ms, int* out_numfds);
+/* 从其它线程打断 nb_multi_poll / 唤醒事件循环（libcurl curl_multi_wakeup）。 */
+NB_API int NB_CALL nb_multi_wakeup(nb_multi* m);
+
+/* 跨平台 poll 原语：把多路 multi 的 socket 并成一次等待。
+   返回就绪条目数，或负值（-1 = 参数错、-2 = 系统调用失败、-3 = 被中断）。 */
+NB_API int NB_CALL nb_poll_sockets(nb_poll_item* items, int count, long timeout_ms);
 
 #ifdef __cplusplus
 }

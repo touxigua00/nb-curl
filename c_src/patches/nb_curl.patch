@@ -57,32 +57,42 @@
 #  12. Curl_ossl_ctx_init(): enable SSL_CTX_set_grease_sigalgs_enabled()
 #      when CURLOPT_TLS_GREASE_SIGALGS is set - random GREASE value at the
 #      head of the signature_algorithms extension (Chrome 152+ behavior).
-#  13. set_trust_anchors(): curl-impersonate permutes the trust_anchors
-#      (51764) list with a fresh Curl_rand() draw on EVERY connection. A
-#      live Chrome 152 sent byte-identical 186-byte lists on 30 consecutive
-#      connections and switched to a different order only on a later browser
-#      run: the permutation is fixed for the lifetime of the browser
-#      process. Ours now seeds a xorshift32 once per process, so all
-#      connections of one run agree with each other (and runs still differ).
-#      Only the temporary wire order changes; the configured value stays
-#      untouched, so connection and session cache keys are unaffected.
+#  13. set_trust_anchors(): the trust_anchors (51764) list is no longer
+#      reordered at all. curl-impersonate permuted it with a fresh
+#      Curl_rand() draw on EVERY connection, and we had then drawn the
+#      permutation once per process. Chrome does neither: a live Chrome 154
+#      sorts the 28 IDs by their encoded RELATIVE-OID bytes and emits the
+#      exact same 186 bytes on every connection of every browser process
+#      (verified 2026-10-13 - three separate launches, independent profiles,
+#      identical payload). The configured list is now emitted verbatim, so
+#      the payload can never vary again. Only the wire order is concerned;
+#      connection and session cache keys are built from the configured
+#      value and are unaffected.
 #
 # lib/impersonate.c
 #  14. chrome131 / chrome146 / chrome150 / firefox147 presets: default
 #      headers announce Windows instead of macOS (sec-ch-ua-platform and
-#      User-Agent). TLS fingerprint unchanged. New "chrome152" preset,
-#      captured from a real browser (2026-09-11, Windows x64): chrome150
-#      TLS base + GREASE in signature_algorithms (tls_grease_sigalgs) +
-#      trust_anchors(51764) + Chrome 152 default headers.
-#  15. chrome152: trust_anchors(51764) now carries the 28 trust anchor IDs
-#      of Chrome's built-in root store instead of an empty list. It used to
-#      be empty because xcctls.top/all reports the extension without a
+#      User-Agent). TLS fingerprint unchanged. "chrome155" preset (named
+#      "chrome152" before 2026-10-15; the old name is gone): chrome150 TLS
+#      base + GREASE in signature_algorithms (tls_grease_sigalgs) +
+#      trust_anchors(51764) + Chrome 155 default headers. sec-ch-ua,
+#      User-Agent and Accept were re-captured from a live
+#      Chrome 155.0.8059.80 (2026-10-15); the TLS layer was already
+#      identical to a real Chrome, only those three headers were stale.
+#  15. chrome155: trust_anchors(51764) carries the 28 trust anchor IDs of
+#      Chrome's built-in root store instead of an empty list. It used to be
+#      empty because xcctls.top/all reports the extension without a
 #      dumpable payload, and that empty payload was mistaken for "Chrome
-#      sends an empty list". A real Chrome 152 always sends those 28 IDs
-#      (verified against a live capture, 2026-09-22); they match the
+#      sends an empty list". A real Chrome always sends those 28 IDs (first
+#      verified against a live capture, 2026-09-22); they match the
 #      trust_anchor_id fields of Chromium's
 #      net/data/ssl/chrome_root_store/root_store.textproto one for one.
-#      The chrome152 entry also gained the HTTP/3 (QUIC) fingerprint fields
+#      The order is a live Chrome 154's: sorted by the encoded RELATIVE-OID
+#      bytes, which is the rule Chromium's EncodeTlsRequestedTrustAnchorID-
+#      List applies. Pre-154 Chrome had no stable order (the IDs are a set),
+#      so this one is a valid sample for those versions and the exact value
+#      for 154 and newer.
+#      The chrome155 entry also gained the HTTP/3 (QUIC) fingerprint fields
 #      inherited from chrome150, which had been missing from the patch.
 #
 # include/curl/curl.h, lib/urldata.h, lib/setopt.c, lib/easyoptions.c,
@@ -101,7 +111,7 @@
 #      任何官方版 nghttp3 里；现在我们把 curl-impersonate 的 nghttp3
 #      补丁重定基到 v1.18（deps/patches/nghttp3.patch，应用于
 #      deps/sources/nghttp3-src），补齐了 nghttp3_conn_submit_settings
-#      公开 API，于是原样恢复。chrome150/152 与 firefox147 预设的
+#      公开 API，于是原样恢复。chrome150/155 与 firefox147 预设的
 #      H3 SETTINGS 指纹（含 GREASE 条目）由此生效；未设置
 #      CURLOPT_HTTP3_SETTINGS 时行为与官方 curl 一致。
 #
@@ -621,24 +631,34 @@
        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
        "Sec-Fetch-Site: none",
        "Sec-Fetch-Mode: navigate",
-@@ -1041,6 +1046,114 @@
+@@ -1041,6 +1046,130 @@
      .form_boundary = "webkit",
    },
    {
-+    /* Curl_cffi rework: Chrome 152, captured from a real browser
-+     * (2026-09-11, Windows x64, via xcctls.top/all; trust anchor list re-taken
-+     * on 2026-09-22 from a live Chrome capture).
++    /* Curl_cffi rework: Chrome 155.0.8059.80 (Windows x64), captured
++     * 2026-10-15 from the real browser: TLS ClientHello from a local
++     * listen-only socket, request headers from a local TLS/ALPN(h2) server,
++     * both cross-checked against xcctls.top/all.
++     *
++     * This entry began as a Chrome 152 capture (2026-09-11) and kept that
++     * capture's sec-ch-ua / User-Agent / Accept. The TLS layer had already
++     * been re-taken from a live browser on 2026-09-22 (trust anchor list)
++     * and 2026-10-13 (its order), so the whole entry is Chrome 155 data and
++     * is named accordingly; the headers are the only values that still said
++     * "152" and they now match the real browser too.
++     *
 +     * Differences vs chrome150:
 +     *  - GREASE value at the head of signature_algorithms (tls_grease_sigalgs);
 +     *  - trust_anchors (51764) extension carrying the 28 trust anchor IDs of
 +     *    Chrome's built-in root store. It used to be an empty list because
 +     *    xcctls.top/all reports the extension with no dumpable data; a real
-+     *    Chrome 152 always sends those 28 IDs, and they match the
++     *    Chrome always sends those 28 IDs, and they match the
 +     *    trust_anchor_id fields of Chromium's
 +     *    net/data/ssl/chrome_root_store/root_store.textproto one for one;
-+     *  - updated sec-ch-ua / User-Agent headers. */
-+    .target = "chrome152",
-+    .alias = "chrome152",
++     *  - headers of the current browser: the "Not(A:Brand" brand trio leads
++     *    with Google Chrome, and Accept lists image/jxl. */
++    .target = "chrome155",
++    .alias = "chrome155",
 +    .httpversion = CURL_HTTP_VERSION_2_0,
 +    .ssl_version = CURL_SSLVERSION_TLSv1_2 | CURL_SSLVERSION_MAX_DEFAULT,
 +    .ciphers =
@@ -677,12 +697,12 @@
 +    .tls_session_ticket = true,
 +    .cert_compression = "brotli",
 +    .http_headers = {
-+      "sec-ch-ua: \"Chromium\";v=\"152\", \"Not?A_Brand\";v=\"24\", \"Google Chrome\";v=\"152\"",
++      "sec-ch-ua: \"Google Chrome\";v=\"155\", \"Chromium\";v=\"155\", \"Not(A:Brand\";v=\"24\"",
 +      "sec-ch-ua-mobile: ?0",
 +      "sec-ch-ua-platform: \"Windows\"",
 +      "Upgrade-Insecure-Requests: 1",
-+      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
-+      "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
++      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
++      "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
 +      "Sec-Fetch-Site: none",
 +      "Sec-Fetch-Mode: navigate",
 +      "Sec-Fetch-User: ?1",
@@ -696,8 +716,8 @@
 +    .http2_stream_weight = 256,
 +    .http2_stream_exclusive = 1,
 +    /* Curl_cffi rework (nb-curl): H3/QUIC fingerprint fields inherited
-+     * from chrome150 (identical in Chrome 152); they were missing from
-+     * the original chrome152 entry because it was captured before this
++     * from chrome150 (identical in Chrome 155); they were missing from
++     * the original Chrome 152 capture because it was taken before this
 +     * tree had HTTP/3 support. */
 +    .http3_sig_hash_algs =
 +      "ecdsa_secp256r1_sha256:"
@@ -715,15 +735,21 @@
 +    .quic_transport_parameters = "1:30000;3:1472;4:15728640;5:6291456;6:6291456;7:6291456;8:100;9:103;15:;17:1@1,GREASE;32:65536;12584:0x4f524947;GREASE",
 +    .http3_tls_extension_order = "0-10-13-16-27-43-45-51-57-17613-65037",
 +    .ech = "true",
++    /* The 28 trust anchor IDs of Chrome's built-in root store, in the order a
++     * live Chrome 155 sends them: sorted by the encoded RELATIVE-OID bytes,
++     * which is the rule Chromium's EncodeTlsRequestedTrustAnchorIDList applies.
++     * Re-verified against Chrome 155.0.8059.80 on 2026-10-15 (same 186 bytes,
++     * sha256 734236b2...f16c as the Chrome 154 capture). The value is emitted
++     * verbatim (see set_trust_anchors() in lib/vtls/openssl.c) - never
++     * reordered at runtime. */
 +    .tls_trust_anchors =
-+      "52580.200109.1.10,44947.2.1,52580.200109.1.7,11129.9.11,"
-+      "44947.2.6,11129.9.5,11129.9.10,44947.2.18,"
-+      "52580.200109.1.13,11129.9.8,11129.9.13,11129.9.12,"
-+      "52580.200109.1.19,52580.200109.1.12,44947.2.19,"
-+      "52580.200109.1.9,11129.9.4,11129.9.1,52580.200109.1.18,"
-+      "11129.9.15,44947.2.13,52580.200109.1.8,44947.2.14,"
-+      "11129.9.6,44947.2.15,52580.200109.1.11,11129.9.7,"
-+      "44947.2.20",
++      "44947.2.1,44947.2.6,44947.2.13,44947.2.14,44947.2.15,44947.2.18,"
++      "44947.2.19,44947.2.20,52580.200109.1.7,52580.200109.1.8,"
++      "52580.200109.1.9,52580.200109.1.10,52580.200109.1.11,"
++      "52580.200109.1.12,52580.200109.1.13,52580.200109.1.18,"
++      "52580.200109.1.19,11129.9.1,11129.9.4,11129.9.5,11129.9.6,"
++      "11129.9.7,11129.9.8,11129.9.10,11129.9.11,11129.9.12,"
++      "11129.9.13,11129.9.15",
 +    .tls_extension_order = NULL,
 +    .tls_use_new_alps_codepoint = true,
 +    .tls_signed_cert_timestamps = true,
@@ -736,7 +762,7 @@
      .target = "chrome99",
      .alias = "chrome99",
      .httpversion = CURL_HTTP_VERSION_2_0,
-@@ -1471,8 +1584,9 @@
+@@ -1471,8 +1600,9 @@
        "TLS_RSA_WITH_AES_256_GCM_SHA384:"
        "TLS_RSA_WITH_AES_128_CBC_SHA:"
        "TLS_RSA_WITH_AES_256_CBC_SHA",
@@ -809,6 +835,29 @@
    BIT(stream_exclusive); /* HTTP/2 dependency is exclusive */
    BIT(post301); /* keep POSTs as POSTs after a 301 request */
    BIT(post302); /* keep POSTs as POSTs after a 302 request */
+--- a/lib/vquic/cf-ngtcp2.c
++++ b/lib/vquic/cf-ngtcp2.c
+@@ -423,6 +423,12 @@
+ #pragma GCC diagnostic pop
+ #endif
+ 
++/* Curl_cffi rework: re-enabled curl-impersonate's H3 custom-settings
++ * support.  The nghttp3_conn_submit_settings() /
++ * nghttp3_settings_entry symbols it needs do not exist in upstream
++ * nghttp3, so deps/sources/nghttp3-src carries our rebased port of
++ * curl-impersonate's nghttp3 patch (deps/patches/nghttp3.patch).
++ * Without CURLOPT_HTTP3_SETTINGS the behavior is unchanged. */
+ static void h3_apply_setting(nghttp3_settings *settings,
+                              unsigned long id, uint64_t value)
+ {
+@@ -590,7 +596,6 @@
+   return i;
+ }
+ 
+-
+ static CURLcode init_ngh3_conn(struct Curl_cfilter *cf,
+                                struct Curl_easy *data,
+                                struct cf_ngtcp2_ctx *ctx)
 --- a/lib/vquic/cf-ngtcp2-cmn.c
 +++ b/lib/vquic/cf-ngtcp2-cmn.c
 @@ -1805,18 +1805,12 @@
@@ -836,29 +885,6 @@
  
    result = Curl_vquic_tls_init(&ctx->tls, cf, data,
                                 &ctx->ssl_peer, &ALPN_SPEC_H3,
---- a/lib/vquic/cf-ngtcp2.c
-+++ b/lib/vquic/cf-ngtcp2.c
-@@ -423,6 +423,12 @@
- #pragma GCC diagnostic pop
- #endif
- 
-+/* Curl_cffi rework: re-enabled curl-impersonate's H3 custom-settings
-+ * support.  The nghttp3_conn_submit_settings() /
-+ * nghttp3_settings_entry symbols it needs do not exist in upstream
-+ * nghttp3, so deps/sources/nghttp3-src carries our rebased port of
-+ * curl-impersonate's nghttp3 patch (deps/patches/nghttp3.patch).
-+ * Without CURLOPT_HTTP3_SETTINGS the behavior is unchanged. */
- static void h3_apply_setting(nghttp3_settings *settings,
-                              unsigned long id, uint64_t value)
- {
-@@ -590,7 +596,6 @@
-   return i;
- }
- 
--
- static CURLcode init_ngh3_conn(struct Curl_cfilter *cf,
-                                struct Curl_easy *data,
-                                struct cf_ngtcp2_ctx *ctx)
 --- a/lib/vtls/openssl.c
 +++ b/lib/vtls/openssl.c
 @@ -190,7 +190,9 @@
@@ -899,52 +925,55 @@
      ERR_clear_error();
      CURL_TRC_CF(data, cf, "send SSL close notify");
      rc = SSL_shutdown(octx->ssl);
-@@ -4117,6 +4132,18 @@
+@@ -4060,11 +4075,7 @@
+                                   const char *anchors)
+ {
+   CBB ids;
+-  CURLcode result = CURLE_OK;
+   const char *start = anchors;
+-  size_t id_count = 0;
+-  size_t *offsets = NULL;
+-  unsigned char *shuffled = NULL;
  
-   {
-     const unsigned char *encoded = CBB_data(&ids);
-+    /* Curl_cffi rework: Chromium picks one random order for a whole browser
-+     * run and keeps it on every connection - a captured Chrome 152 sent the
-+     * very same 186 bytes on 30 consecutive connections, and a different
-+     * order 30 minutes later. Redrawing the permutation per connection made
-+     * our own consecutive connections disagree with each other, which is
-+     * something Chrome never does, so derive it from a seed that lives as
-+     * long as the process instead. Only the temporary wire order changes; the
-+     * configured value stays untouched, so connection and session cache keys
-+     * are unaffected. */
-+    static bool seeded = FALSE;
-+    static unsigned int seed;
-+    unsigned int state;
-     size_t i;
-     size_t offset = 0;
- 
-@@ -4125,23 +4152,30 @@
-       offset += encoded[offset] + 1;
+   if(!anchors[0]) {
+     if(SSL_CTX_set1_requested_trust_anchors(ctx, NULL, 0))
+@@ -4097,7 +4108,6 @@
+       failf(data, "invalid TLS trust anchor list: '%s'", anchors);
+       return CURLE_BAD_FUNCTION_ARGUMENT;
      }
+-    id_count++;
+     if(!*next)
+       break;
+     start = next + 1;
+@@ -4108,64 +4118,33 @@
+     }
+   }
  
+-  offsets = calloc(id_count, sizeof(*offsets));
+-  shuffled = malloc(CBB_len(&ids));
+-  if(!offsets || !shuffled) {
+-    result = CURLE_OUT_OF_MEMORY;
+-    goto out;
+-  }
+-
+-  {
+-    const unsigned char *encoded = CBB_data(&ids);
+-    size_t i;
+-    size_t offset = 0;
+-
+-    for(i = 0; i < id_count; i++) {
+-      offsets[i] = offset;
+-      offset += encoded[offset] + 1;
+-    }
+-
 -    /* The IDs form a set. Randomize only the temporary wire order, leaving
 -     * the configured value stable for connection and session cache keys. */
-+    if(!seeded) {
-+      unsigned char drawn[sizeof(seed)];
-+
-+      result = Curl_rand(data, drawn, sizeof(drawn));
-+      if(result) {
-+        failf(data, "failed seeding TLS trust anchor order");
-+        goto out;
-+      }
-+      memcpy(&seed, drawn, sizeof(seed));
-+      seeded = TRUE;
-+    }
-+
-+    state = seed ? seed : 1u;
-     for(i = id_count; i > 1; i--) {
+-    for(i = id_count; i > 1; i--) {
 -      size_t random;
 -      size_t threshold = (size_t)(-i) % i;
-+      /* xorshift32, seeded once per process: every connection of this process
-+       * therefore emits the same permutation. */
-       size_t selected;
-       size_t swap;
- 
+-      size_t selected;
+-      size_t swap;
+-
 -      do {
 -        result = Curl_rand(data, (unsigned char *)&random, sizeof(random));
 -        if(result) {
@@ -952,16 +981,59 @@
 -          goto out;
 -        }
 -      } while(random < threshold);
-+      state ^= state << 13;
-+      state ^= state >> 17;
-+      state ^= state << 5;
-+      selected = (size_t)(state % (unsigned int)i);
- 
+-
 -      selected = random % i;
-       swap = offsets[i - 1];
-       offsets[i - 1] = offsets[selected];
-       offsets[selected] = swap;
-@@ -4474,6 +4508,11 @@
+-      swap = offsets[i - 1];
+-      offsets[i - 1] = offsets[selected];
+-      offsets[selected] = swap;
+-    }
+-
+-    offset = 0;
+-    for(i = 0; i < id_count; i++) {
+-      size_t encoded_len = encoded[offsets[i]] + 1;
+-      memcpy(&shuffled[offset], &encoded[offsets[i]], encoded_len);
+-      offset += encoded_len;
+-    }
+-  }
+-
+-  if(!SSL_CTX_set1_requested_trust_anchors(ctx, shuffled, CBB_len(&ids))) {
+-    result = CURLE_SSL_CONNECT_ERROR;
++  /* Curl_cffi rework: send the configured list verbatim, in the order it was
++   * written - no shuffling, no reordering.
++   *
++   * A live Chrome sorts the 28 trust anchor IDs by their encoded
++   * RELATIVE-OID bytes and then emits the exact same 186 bytes on EVERY
++   * connection, in EVERY browser process (verified 2026-10-13 on Chrome 154,
++   * re-verified 2026-10-15 on Chrome 155.0.8059.80: three launches with
++   * independent profiles plus the xcctls.top/all dump, all producing sha256
++   * 734236b257e52e7d202b222a0694fedf187c12b11a4fcc733dd00f3331b7f16c). The
++   * IDs are a set, so pre-154 Chrome had no observable order to match and any
++   * permutation was plausible; from 154 on the sorted order is the only one
++   * seen, and it stays valid for older versions, so the preset now carries
++   * exactly that order.
++   *
++   * curl-impersonate redrew the permutation on every connection and we had
++   * then drawn it once per process, which made our payload vary where Chrome
++   * never does. Both are gone. The configured value - and therefore the
++   * connection and session cache keys - is unaffected. */
++  if(!SSL_CTX_set1_requested_trust_anchors(ctx, CBB_data(&ids),
++                                           CBB_len(&ids))) {
+     failf(data, "failed setting TLS trust anchor list");
+-    goto out;
++    CBB_cleanup(&ids);
++    return CURLE_SSL_CONNECT_ERROR;
+   }
+ 
+-out:
+   CBB_cleanup(&ids);
+-  free(offsets);
+-  free(shuffled);
+-  return result;
++  return CURLE_OK;
+ }
+ #endif
+ 
+@@ -4474,6 +4453,11 @@
    else if(data->set.tls_grease)
      SSL_CTX_set_grease_enabled(octx->ssl_ctx, 1);
  

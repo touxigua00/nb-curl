@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #include "nb_curl_bridge.h"
 #include <curl/curl.h>
@@ -33,6 +34,7 @@
    winsock2.h 提供，不需要额外 include。 */
 #ifndef _WIN32
 #  include <errno.h>
+#  include <poll.h>
 #  include <sys/socket.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
@@ -101,6 +103,29 @@ static void nb_buf_reset(nb_buf* b)
 static void nb_buf_free(nb_buf* b)
 {
     free(b->data);
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
+/* 空闲句柄不能无限保留历史超大正文容量：容量超过 keep 就整块释放，
+   下次 append 按需重新增长（否则一个 100MB 响应会让这只句柄永久占着 100MB）。 */
+#define NB_BUF_KEEP_CAP (16u * 1024u)
+
+static void nb_buf_shrink(nb_buf* b)
+{
+    if(b->cap > NB_BUF_KEEP_CAP)
+        nb_buf_free(b);
+    else
+        nb_buf_reset(b);
+}
+
+/* 结果所有权移交：把 C 累积缓冲整块交给调用方（不做任何复制），
+   句柄内缓冲置空。调用方负责 free（easy_free_string）。 */
+static void nb_buf_take(nb_buf* b, char** out, size_t* len)
+{
+    if(len) *len = b->len;
+    if(out) *out = b->data;
     b->data = NULL;
     b->len = 0;
     b->cap = 0;
@@ -484,8 +509,8 @@ void easy_reset(nb_easy* e)
         hd->post_len = 0;
         free(hd->method);
         hd->method = NULL;
-        nb_buf_reset(&hd->body);
-        nb_buf_reset(&hd->head);
+        nb_buf_shrink(&hd->body);
+        nb_buf_shrink(&hd->head);
         /* curl_easy_reset 已把所有 setopt 清掉（包括 slist option 持有的指针），
            这里只释放我们托管的 slist 内存本身。 */
         nb_free_opt_slists(hd);
@@ -1171,9 +1196,13 @@ int easy_ws_recv(nb_easy* e, char* buf, int cap,
 /* ================================================================== */
 /* 执行与信息                                                          */
 /* ================================================================== */
-int easy_perform(nb_easy* e, int* status_code, char** body,
-                 size_t* body_len, char** headers, size_t* headers_len,
-                 char** error_msg)
+/* easy_perform / easy_perform_take 的公共实现。
+   take=0：body/headers 复制一份（nb_strndup，老 ABI 语义，handle 缓冲保留复用）；
+   take=1：body/headers **整块移交**给调用方，handle 缓冲置空 —— 少一次整块拷贝。
+   失败（CURLE_*）时不留残余大缓冲：take 版直接释放，非 take 版按 keep 收缩。 */
+static int nb_perform_impl(nb_easy* e, int* status_code, char** body,
+                           size_t* body_len, char** headers, size_t* headers_len,
+                           char** error_msg, int take)
 {
     CURL* c = (CURL*)e;
     HandleData* hd = nb_hd(e);
@@ -1203,22 +1232,90 @@ int easy_perform(nb_easy* e, int* status_code, char** body,
         *status_code = (int)code;
 
     if(headers) {
-        *headers = nb_strndup(hd->head.data ? hd->head.data : "", hd->head.len);
-        if(headers_len) *headers_len = hd->head.len;
+        if(take)
+            nb_buf_take(&hd->head, headers, headers_len);
+        else {
+            *headers = nb_strndup(hd->head.data ? hd->head.data : "", hd->head.len);
+            if(headers_len) *headers_len = hd->head.len;
+        }
     }
 
     if(res == CURLE_OK) {
         if(body) {
-            *body = nb_strndup(hd->body.data ? hd->body.data : "", hd->body.len);
-            if(body_len) *body_len = hd->body.len;
+            if(take)
+                nb_buf_take(&hd->body, body, body_len);
+            else {
+                *body = nb_strndup(hd->body.data ? hd->body.data : "", hd->body.len);
+                if(body_len) *body_len = hd->body.len;
+            }
         }
     }
     else {
         if(error_msg)
             *error_msg = nb_strdup(curl_easy_strerror(res));
+        /* 失败：不把可能很大的半截正文留在句柄上，也不复制给调用方 */
+        if(take)
+            nb_buf_shrink(&hd->body);
     }
 
     return (int)res;
+}
+
+int easy_perform(nb_easy* e, int* status_code, char** body,
+                 size_t* body_len, char** headers, size_t* headers_len,
+                 char** error_msg)
+{
+    return nb_perform_impl(e, status_code, body, body_len,
+                           headers, headers_len, error_msg, 0);
+}
+
+int easy_perform_take(nb_easy* e, int* status_code, char** body,
+                      size_t* body_len, char** headers, size_t* headers_len,
+                      char** error_msg)
+{
+    return nb_perform_impl(e, status_code, body, body_len,
+                           headers, headers_len, error_msg, 1);
+}
+
+/* multi 路径的"准备"：清结果缓冲 + 把 method/body 落到句柄上。
+   必须在 nb_multi_add 之前调用（multi 路径不走 easy_perform）。 */
+int easy_prepare_request(nb_easy* e)
+{
+    CURL* c = (CURL*)e;
+    HandleData* hd = nb_hd(e);
+    if(!c || !hd)
+        return -1;
+    nb_buf_reset(&hd->body);
+    nb_buf_reset(&hd->head);
+    hd->snap_ok = 0;
+    hd->tcp_sockopt_ran = 0;
+    nb_apply_request(c, hd);
+    return 0;
+}
+
+int easy_take_body(nb_easy* e, char** out, size_t* len)
+{
+    HandleData* hd = nb_hd(e);
+    if(!hd)
+        return -1;
+    nb_buf_take(&hd->body, out, len);
+    return 0;
+}
+
+int easy_take_headers(nb_easy* e, char** out, size_t* len)
+{
+    HandleData* hd = nb_hd(e);
+    if(!hd)
+        return -1;
+    nb_buf_take(&hd->head, out, len);
+    return 0;
+}
+
+int easy_pause(nb_easy* e, int bitmask)
+{
+    if(!e)
+        return -1;
+    return (int)curl_easy_pause((CURL*)e, bitmask);
 }
 
 void easy_free_string(char* ptr)
@@ -1252,4 +1349,538 @@ const char* easy_version(void)
 const char* easy_strerror(int code)
 {
     return curl_easy_strerror((CURLcode)code);
+}
+
+/* ================================================================== */
+/* 阶段 2：multi 驱动                                                  */
+/* ================================================================== */
+/*
+ * 一个 nb_multi 只由一个所有者线程操作（与放进它的 easy 句柄同属一线程）。
+ * 唯一例外是 nb_multi_wakeup：libcurl 明确允许从其它线程调它来打断等待。
+ *
+ * socket / timer 回调在 nb_multi_init 时一次性挂好，生命周期与 nb_multi 一致，
+ * 因此调用方**不需要**保活任何回调对象（这是相对"Python 侧回调"的关键差别）。
+ */
+
+typedef struct {
+    CURLM*        m;
+    nb_sock_info* socks;        /* 槽位数组；fd < 0 表示空槽 */
+    int           n_socks;      /* 槽位容量 */
+    nb_sock_info* changes;      /* 按回调顺序记录，消费后复用容量 */
+    int           n_changes;
+    int           changes_cap;
+    int           running;      /* 上一次 drive 后的活跃传输数 */
+    int           in_callback;  /* >0 = 正在一次会触发 libcurl 回调的调用里
+                                   （perform / socket_action / fire_timer / poll /
+                                    add / remove）；cleanup 期间不允许 */
+    int           broken;       /* 出现致命 CURLMcode 后置位，调用方应丢弃该 multi */
+} NbMulti;
+
+static int nb_multi_queue_socket(NbMulti* mm, curl_socket_t s, int what)
+{
+    nb_sock_info* change;
+    if(mm->n_changes == mm->changes_cap) {
+        int ncap;
+        nb_sock_info* np;
+        if(mm->changes_cap > INT_MAX / 2)
+            goto broken;
+        ncap = mm->changes_cap ? mm->changes_cap * 2 : 16;
+        if((size_t)ncap > SIZE_MAX / sizeof(nb_sock_info))
+            goto broken;
+        np = (nb_sock_info*)realloc(mm->changes,
+                                    (size_t)ncap * sizeof(nb_sock_info));
+        if(!np)
+            goto broken;
+        mm->changes = np;
+        mm->changes_cap = ncap;
+    }
+    change = &mm->changes[mm->n_changes++];
+    change->fd = (long long)s;
+    change->action = what;
+    change->_reserved = 0;
+    return 0;
+
+broken:
+    mm->broken = 1;
+    return -1;
+}
+
+/* socketp 保存槽位编号 + 1，数组扩容不会使它失效。 */
+static int nb_multi_sock_cb(CURL* easy, curl_socket_t s, int what,
+                            void* ud, void* socketp)
+{
+    NbMulti* mm = (NbMulti*)ud;
+    int i;
+    int slot = -1;
+    int free_slot = -1;
+
+    (void)easy;
+    if(!mm)
+        return 0;
+    if(mm->broken)
+        return -1;
+    if(nb_multi_queue_socket(mm, s, what) != 0)
+        return -1;
+
+    if(socketp)
+        slot = (int)((uintptr_t)socketp - 1);
+    else {
+        for(i = 0; i < mm->n_socks; i++) {
+            if(mm->socks[i].fd == (long long)s) {
+                slot = i;
+                break;
+            }
+            if(free_slot < 0 && mm->socks[i].fd < 0)
+                free_slot = i;
+        }
+    }
+
+    if(what == CURL_POLL_REMOVE) {
+        if(slot >= 0) {
+            mm->socks[slot].fd = -1;
+            mm->socks[slot].action = CURL_POLL_NONE;
+        }
+        if(curl_multi_assign(mm->m, s, NULL) != CURLM_OK)
+            goto broken;
+        return 0;
+    }
+
+    if(slot < 0) {
+        if(free_slot < 0) {
+            int ncap;
+            nb_sock_info* np;
+            if(mm->n_socks > INT_MAX / 2)
+                goto broken;
+            ncap = mm->n_socks ? mm->n_socks * 2 : 16;
+            if((size_t)ncap > SIZE_MAX / sizeof(nb_sock_info))
+                goto broken;
+            np = (nb_sock_info*)realloc(mm->socks,
+                                        (size_t)ncap * sizeof(nb_sock_info));
+            if(!np)
+                goto broken;
+            memset(np + mm->n_socks, 0,
+                   (size_t)(ncap - mm->n_socks) * sizeof(nb_sock_info));
+            for(i = mm->n_socks; i < ncap; i++)
+                np[i].fd = -1;
+            free_slot = mm->n_socks;
+            mm->socks = np;
+            mm->n_socks = ncap;
+        }
+        slot = free_slot;
+    }
+
+    mm->socks[slot].fd = (long long)s;
+    mm->socks[slot].action = what;
+    if(!socketp && curl_multi_assign(mm->m, s,
+                                    (void*)(uintptr_t)(slot + 1)) != CURLM_OK)
+        goto broken;
+    return 0;
+
+broken:
+    mm->broken = 1;
+    return -1;
+}
+
+/* timer 回调：只保留"libcurl 需要重算定时器"的通知语义。
+   超时值**不从这里取**：回调里的相对毫秒值在别的事件之后就无法再换算成到期点
+   （libcurl 会用同样的相对值给出一个新的绝对到期点）。调用方一律用
+   nb_multi_timer() 现取剩余时间。
+   这里也**不能**递归调 socket_action（libcurl 禁止回调内重入），
+   由调用方在本轮 drive 返回后调 nb_multi_fire_timer。 */
+static int nb_multi_timer_cb(CURLM* m, long timeout_ms, void* ud)
+{
+    (void)m;
+    (void)timeout_ms;
+    (void)ud;
+    return 0;
+}
+
+int nb_multi_abi_version(void)
+{
+    return 3;
+}
+
+nb_multi* nb_multi_init(void)
+{
+    CURLM* cm;
+    NbMulti* mm;
+    int i;
+
+    if(!g_inited && nb_global_init() != 0)
+        return NULL;
+
+    cm = curl_multi_init();
+    if(!cm)
+        return NULL;
+
+    mm = (NbMulti*)calloc(1, sizeof(NbMulti));
+    if(!mm) {
+        curl_multi_cleanup(cm);
+        return NULL;
+    }
+    mm->m = cm;
+    mm->n_socks = 16;
+    mm->socks = (nb_sock_info*)calloc((size_t)mm->n_socks, sizeof(nb_sock_info));
+    if(!mm->socks) {
+        curl_multi_cleanup(cm);
+        free(mm);
+        return NULL;
+    }
+    for(i = 0; i < mm->n_socks; i++)
+        mm->socks[i].fd = -1;
+
+    /* 回调挂不上就宁可不返回这个 multi：没有 socket/timer 事件来源的 multi 会让
+       Python 侧静默挂死，返回 NULL 才是"确定失败"。 */
+    if(curl_multi_setopt(cm, CURLMOPT_SOCKETFUNCTION, nb_multi_sock_cb) != CURLM_OK
+       || curl_multi_setopt(cm, CURLMOPT_SOCKETDATA, mm) != CURLM_OK
+       || curl_multi_setopt(cm, CURLMOPT_TIMERFUNCTION, nb_multi_timer_cb) != CURLM_OK
+       || curl_multi_setopt(cm, CURLMOPT_TIMERDATA, mm) != CURLM_OK) {
+        curl_multi_cleanup(cm);
+        free(mm->socks);
+        free(mm);
+        return NULL;
+    }
+
+    return (nb_multi*)mm;
+}
+
+void nb_multi_cleanup(nb_multi* m)
+{
+    NbMulti* mm = (NbMulti*)m;
+    if(!mm)
+        return;
+    if(mm->in_callback) {
+        /* 回调期间释放会留下悬空指针：拒绝并标记，交给调用方在回调外重试 */
+        mm->broken = 1;
+        return;
+    }
+    /* 仍在 multi 里的 easy **不会**被释放（归 Python 的 _Handle 所有）；
+       curl_multi_cleanup 会把它们摘出去。调用方本应先 nb_multi_remove。 */
+    curl_multi_cleanup(mm->m);
+    free(mm->changes);
+    free(mm->socks);
+    free(mm);
+}
+
+int nb_multi_add(nb_multi* m, nb_easy* e)
+{
+    NbMulti* mm = (NbMulti*)m;
+    CURLMcode rc;
+    if(!mm || !e)
+        return -1;
+    if(mm->broken)
+        return -2;
+    mm->in_callback++;                  /* add 也会触发 socket/timer 回调 */
+    rc = curl_multi_add_handle(mm->m, (CURL*)e);
+    mm->in_callback--;
+    if(rc != CURLM_OK)
+        return -(int)rc;
+    /* 回调里（例如 fd 表扩容失败）把 multi 标成 broken 时，这里必须让调用方看到 */
+    return mm->broken ? -2 : 0;
+}
+
+int nb_multi_remove(nb_multi* m, nb_easy* e)
+{
+    NbMulti* mm = (NbMulti*)m;
+    CURLMcode rc;
+    if(!mm || !e)
+        return -1;
+    mm->in_callback++;                  /* remove 也会触发 socket 回调（REMOVE） */
+    rc = curl_multi_remove_handle(mm->m, (CURL*)e);
+    mm->in_callback--;
+    if(rc != CURLM_OK)
+        return -(int)rc;
+    /* 摘掉之后 libcurl 会为它用过的 socket 回调 CURL_POLL_REMOVE，
+       fd 表随之清理；这里不再额外动表（同一个 fd 可能还归别的 easy）。 */
+    return mm->broken ? -2 : 0;
+}
+
+int nb_multi_active(nb_multi* m)
+{
+    NbMulti* mm = (NbMulti*)m;
+    if(!mm)
+        return -1;
+    if(mm->broken)
+        return -1;
+    return mm->running;
+}
+
+int nb_multi_perform(nb_multi* m)
+{
+    NbMulti* mm = (NbMulti*)m;
+    CURLMcode rc;
+    int running = 0;
+
+    if(!mm)
+        return -1;
+    if(mm->broken)
+        return -2;
+
+    mm->in_callback++;
+    rc = curl_multi_perform(mm->m, &running);
+    mm->in_callback--;
+
+    if(rc != CURLM_OK) {
+        mm->broken = 1;
+        return -(int)rc;
+    }
+    mm->running = running;
+    return mm->broken ? -2 : running;
+}
+
+int nb_multi_socket_action(nb_multi* m, long long fd, int ev_bitmask)
+{
+    NbMulti* mm = (NbMulti*)m;
+    CURLMcode rc;
+    int running = 0;
+    curl_socket_t cs;
+
+    if(!mm)
+        return -1;
+    if(mm->broken)
+        return -2;
+
+    cs = (fd < 0) ? CURL_SOCKET_TIMEOUT : (curl_socket_t)fd;
+
+    mm->in_callback++;
+    rc = curl_multi_socket_action(mm->m, cs, ev_bitmask, &running);
+    mm->in_callback--;
+
+    if(rc != CURLM_OK) {
+        mm->broken = 1;
+        return -(int)rc;
+    }
+    mm->running = running;
+    return mm->broken ? -2 : running;
+}
+
+int nb_multi_socket_snapshot(nb_multi* m, nb_sock_info* out, int cap, int* total)
+{
+    NbMulti* mm = (NbMulti*)m;
+    int i;
+    int n = 0;
+
+    if(!mm || cap < 0 || (cap > 0 && !out))
+        return -1;
+
+    for(i = 0; i < mm->n_socks; i++) {
+        if(mm->socks[i].fd < 0 || mm->socks[i].action == CURL_POLL_NONE)
+            continue;
+        if(n < cap)
+            out[n] = mm->socks[i];
+        n++;
+    }
+    if(total)
+        *total = n;
+    return n < cap ? n : cap;
+}
+
+int nb_multi_socket_changes(nb_multi* m, nb_sock_info* out, int cap, int* total)
+{
+    NbMulti* mm = (NbMulti*)m;
+    int n;
+    if(!mm || cap < 0 || (cap > 0 && !out))
+        return -1;
+    if(mm->broken)
+        return -2;
+    n = mm->n_changes;
+    if(total)
+        *total = n;
+    if(!out || cap < n)
+        return 0;
+    if(n)
+        memcpy(out, mm->changes, (size_t)n * sizeof(nb_sock_info));
+    mm->n_changes = 0;
+    return n;
+}
+
+int nb_multi_timer(nb_multi* m, long* out_ms)
+{
+    NbMulti* mm = (NbMulti*)m;
+    CURLMcode rc;
+    long ms = -1;
+
+    if(!mm || !out_ms)
+        return -1;
+    if(mm->broken)
+        return -2;
+
+    /* 公开 API curl_multi_timeout()：以"现在"为基准重算剩余毫秒，
+       0 = 已到期、-1 = 没有定时器。绝不用 timer 回调里那份相对值 ——
+       它代表的是回调那一刻的剩余量，之后其它事件已经把它变成过去时。 */
+    rc = curl_multi_timeout(mm->m, &ms);
+    if(rc != CURLM_OK) {
+        mm->broken = 1;
+        return -(int)rc;
+    }
+    *out_ms = ms;
+    return 0;
+}
+
+int nb_multi_fire_timer(nb_multi* m)
+{
+    NbMulti* mm = (NbMulti*)m;
+    CURLMcode rc;
+    int running = 0;
+
+    if(!mm)
+        return -1;
+    if(mm->broken)
+        return -2;
+
+    mm->in_callback++;
+    rc = curl_multi_socket_action(mm->m, CURL_SOCKET_TIMEOUT, 0, &running);
+    mm->in_callback--;
+
+    if(rc != CURLM_OK) {
+        mm->broken = 1;
+        return -(int)rc;
+    }
+    mm->running = running;
+    return mm->broken ? -2 : running;
+}
+
+int nb_multi_drain(nb_multi* m, int* msg, int* code, nb_easy** easy_out)
+{
+    NbMulti* mm = (NbMulti*)m;
+    CURLMsg* item;
+    int left = 0;
+
+    if(!mm)
+        return -1;
+
+    item = curl_multi_info_read(mm->m, &left);
+    if(!item)
+        return 0;
+
+    if(msg)
+        *msg = (int)item->msg;
+    if(code)
+        *code = (int)item->data.result;
+    if(easy_out)
+        *easy_out = (nb_easy*)item->easy_handle;
+    return 1;
+}
+
+int nb_multi_poll(nb_multi* m, long timeout_ms, int* out_numfds)
+{
+    NbMulti* mm = (NbMulti*)m;
+    CURLMcode rc;
+    int nfds = 0;
+
+    if(!mm)
+        return -1;
+    if(mm->broken)
+        return -2;
+
+    /* libcurl 的 curl_multi_poll 要求非负 timeout；负值按"不等待"处理，
+       绝不做无界等待（头文件里的旧说明已同步修正）。 */
+    if(timeout_ms < 0)
+        timeout_ms = 0;
+
+    mm->in_callback++;
+    rc = curl_multi_poll(mm->m, NULL, 0, (int)timeout_ms, &nfds);
+    mm->in_callback--;
+
+    if(out_numfds)
+        *out_numfds = nfds;
+    if(rc != CURLM_OK) {
+        mm->broken = 1;
+        return -(int)rc;
+    }
+    return nfds;
+}
+
+int nb_multi_wakeup(nb_multi* m)
+{
+    NbMulti* mm = (NbMulti*)m;
+    if(!mm)
+        return -1;
+    /* 唯一允许跨线程调用的函数 */
+    return (int)curl_multi_wakeup(mm->m);
+}
+
+/* 跨平台 poll：把多路 multi 的 socket 并成一次等待。
+   Windows 用 WSAPoll（只对 socket 有效，正好符合我们的用途），其余平台用 poll(2)。 */
+int nb_poll_sockets(nb_poll_item* items, int count, long timeout_ms)
+{
+    int i;
+    int ready = 0;
+
+    if(count <= 0 || !items)
+        return -1;
+
+#ifdef _WIN32
+    {
+        WSAPOLLFD* fds = (WSAPOLLFD*)malloc((size_t)count * sizeof(WSAPOLLFD));
+        int rc;
+        if(!fds)
+            return -1;
+        for(i = 0; i < count; i++) {
+            fds[i].fd = (SOCKET)(uintptr_t)items[i].fd;
+            fds[i].events = 0;
+            if(items[i].events & NB_CSELECT_IN)
+                fds[i].events |= POLLRDNORM;
+            if(items[i].events & NB_CSELECT_OUT)
+                fds[i].events |= POLLWRNORM;
+            fds[i].revents = 0;
+        }
+        rc = WSAPoll(fds, (ULONG)count, (INT)timeout_ms);
+        if(rc == SOCKET_ERROR) {
+            free(fds);
+            return -2;
+        }
+        for(i = 0; i < count; i++) {
+            int r = 0;
+            if(fds[i].revents & (POLLRDNORM | POLLIN))
+                r |= NB_CSELECT_IN;
+            if(fds[i].revents & (POLLWRNORM | POLLOUT))
+                r |= NB_CSELECT_OUT;
+            if(fds[i].revents & (POLLERR | POLLHUP | POLLNVAL))
+                r |= NB_CSELECT_ERR;
+            items[i].revents = r;
+            if(r)
+                ready++;
+        }
+        free(fds);
+        return ready;
+    }
+#else
+    {
+        struct pollfd* fds = (struct pollfd*)malloc(
+            (size_t)count * sizeof(struct pollfd));
+        int rc;
+        if(!fds)
+            return -1;
+        for(i = 0; i < count; i++) {
+            fds[i].fd = (int)items[i].fd;
+            fds[i].events = 0;
+            if(items[i].events & NB_CSELECT_IN)
+                fds[i].events |= POLLIN;
+            if(items[i].events & NB_CSELECT_OUT)
+                fds[i].events |= POLLOUT;
+            fds[i].revents = 0;
+        }
+        rc = poll(fds, (nfds_t)count, (int)timeout_ms);
+        if(rc < 0) {
+            int err = errno;
+            free(fds);
+            return (err == EINTR) ? -3 : -2;
+        }
+        for(i = 0; i < count; i++) {
+            int r = 0;
+            if(fds[i].revents & POLLIN)
+                r |= NB_CSELECT_IN;
+            if(fds[i].revents & POLLOUT)
+                r |= NB_CSELECT_OUT;
+            if(fds[i].revents & (POLLERR | POLLHUP | POLLNVAL))
+                r |= NB_CSELECT_ERR;
+            items[i].revents = r;
+            if(r)
+                ready++;
+        }
+        free(fds);
+        return ready;
+    }
+#endif
 }
