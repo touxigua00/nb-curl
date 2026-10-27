@@ -12,10 +12,13 @@ wheel 标签是 ``py3-none-<平台>``：平台相关（因为带二进制），�
 两种 FFI 后端对 Python 版本的依赖不同：
 
 * ``ctypes`` 后端 —— 纯 Python + 标准库，任何 Python 3.x 都能用；
-* ``cffi`` 后端 —— 编译出的 CPython 扩展（``_nb_curl_cffi.cp3XX-*.pyd/.so``），绑定版本。
+* ``cffi`` 后端 —— 编译出的 CPython 扩展，但编译时走的是**稳定 ABI**
+  （cffi 默认 ``py_limited_api=True``），文件名特意不带版本号
+  （``_nb_curl_cffi.pyd`` / ``_nb_curl_cffi.abi3.so``），
+  所以**一份产物所有 Python 3.x 通用**，不需要每个版本各编一次。
 
-因此：Python 版本匹配 → 走 cffi 后端；不匹配 → 扩展加载失败，
-**自动回退 ctypes 后端，功能完全一致**。
+因此：扩展装得上 → 走 cffi 后端；用户没装 cffi 包或加载失败 → **自动回退 ctypes 后端，
+功能完全一致**。
 """
 
 from __future__ import annotations

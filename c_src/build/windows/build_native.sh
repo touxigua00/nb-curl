@@ -57,7 +57,7 @@ echo "=== building nb_curl_native.dll ==="
 "$CL" /nologo /LD /O2 /MD /DNDEBUG /W3 /utf-8 \
     /DNB_BUILD_DLL /DCURL_STATICLIB /DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS \
     /Fo:build/ \
-    native/nb_curl_bridge.c \
+    c_src/native/nb_curl_bridge.c \
     /Fe:build/nb_curl_native.dll \
     /link $LINK_LIBS
 

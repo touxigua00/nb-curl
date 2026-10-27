@@ -9,14 +9,226 @@ nb-curl 的版本变更记录。
   `release/v0.3.0-20260924/`、`release/v0.3.0-20260924-2/`、`release/v0.3.0-20260924-3/`……
 - 本文件按**版本**记录。同一个版本号下的多次交付，改动都归入该版本条目，不另开新版本号。
 - 归档规则只影响 `release/` 目录的命名，PyPI 上仍是标准版本号
-  （`pip install nb-curl==0.3.1`）。
+  （`pip install nb-curl==0.3.2`）。
 
-> **发布状态**：`0.3.1` 是当前版本；`0.3.0` 是上一版（Windows x64 + Linux x86_64 轮子）。
+> **发布状态**：`0.3.2` 是当前版本；`0.3.1` 是上一版（Windows x64 + Linux x86_64 轮子）。
 > `0.3.0` 汇总了 `0.2.2` 之后的**全部**改动 —— 期间版本号曾一个个往上加
 > （`0.3.1`…`0.3.9`、`0.4.0`、`0.5.0`），涨得过快，已把这些中间版本全部折叠回 `0.3.0`，
 > 因此本文件里的 `[0.3.0]` 条目覆盖的是 `0.2.2` 之后到 `0.3.0` 为止的改动。
 >
 > 早于 `0.2.2` 的条目保留在文件末尾，仅作历史。
+
+## [0.3.2] - 2026-10-26
+
+**本版主题：H3 补齐 `trust_anchors` / H2 帧级自定义 / path 转义保真。**
+
+> 0.3.2 = 上一轮（10-26 白天）的 header_order 一等参数 + H3 指纹结构对齐 + path 转义，
+> 加上本轮的 **QUIC 侧 `trust_anchors(51764)`** 与 **`diy_fp={"http2_frames": …}`**。
+> 逐项都有「真机 Chrome 155」的前后对比实测，
+> 复现脚本在 `reports/gap-audit-2026/`（`verify_fixes.py` / `quic_align_probe.py` / `quic_variance.py`）。
+
+### 新增
+
+- **`diy_fp={"http2_frames": …}`：HTTP/2 帧整体可自定义**（SETTINGS / WINDOW_UPDATE /
+  PRIORITY / 伪头顺序），两种写法等价：
+  - 字符串：`"1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p"`
+    （`SETTINGS|WINDOW_UPDATE|PRIORITY|ORDER`，与 `akamai=` 参数同格式；第 3 段
+    写 `0` = 不发 PRIORITY 帧，也可以给 `"1:0:0:201"` 这样的规格）；
+  - 字典：`{"settings": {"HEADER_TABLE_SIZE": 65536, "ENABLE_PUSH": 0, …},
+    "window_updates": {"0": 15663105}, "order": "m,a,s,p"}`，可选第 4 个键 `priority`。
+    `settings` 也收 `"1:65536;2:0"` 字符串；键可以是名字（大小写不敏感）或裸 id，
+    **按写入顺序**发出（条目顺序本身也是指纹的一部分）。`window_updates` 只支持
+    连接级（流 0）；`order` 收 `"m,a,s,p"` / `"masp"` / `["m","a","s","p"]`。
+  取值范围即时校验（未知设置名、非连接级窗口、段数不对都会抛 `FingerprintError`，
+  不会静默忽略）。与 H2 的既有单键（`http2_stream_weight` / `http2_headers_priority` /
+  `http2_no_priority`）可以一起用，互不覆盖。帧级断言见
+  `tests/test_protocols.py::http2.frames_custom`（读服务端收到的原始字节）。
+- **`header_order=` 提升为与 `impersonate` 同级的一等参数**（会话级 + 请求级都收）：
+  `"Host,Connection,sec-ch-ua,..."` 字符串或 `["Host","Connection",...]` 列表；大小写不敏感、
+  重复名只留第一个、`Host` 强制第一位；名单内的头按序排最前、名单外的保持原相对顺序追加在后。
+  不传 = 跟随预设；给了就**压过预设与 `diy_fp={"header_order": …}`**。
+  实现复用已有的 `CURLOPT_HTTPHEADER_ORDER` 覆盖，不必再绕 `diy_fp`。
+  用途：按资源类型切模板（Chrome 的导航与子资源是**两套**头序，见 `docs/17` §2.2）。
+- **`http3_permute_extensions=`**：QUIC ClientHello 的 TLS 扩展顺序是否逐连接随机。
+  不传时 Chrome / Edge 系预设**默认开**（与真机一致：Chrome 155 连抓 3 次得 3 种顺序）。
+
+### 修复
+
+- **QUIC ClientHello 补上 `0xca34`（`trust_anchors`, 51764, 186B）**（C 层，需重编
+  `deps/windows-prebuilt/curl-impersonate`）：根因不是 BoringSSL 抑制，而是
+  `http3_tls_extension_order` 这份显式顺序表**同时是白名单** —— 不在名单里的扩展一律
+  不发，而列表里只写了 `0-10-13-16-27-43-45-51-57-17613-65037`，51764 没写进去。
+  现在**只给 `chrome155` 补上 51764**（位置在 ALPS 与 ECH 之间），它的 QUIC ClientHello
+  扩展数 10 → **11**，与真机一致。为什么不是四个预设都加：`trust_anchors` 这个扩展
+  **Chrome 152 起才有**（仓库里 2026-09 的抓包可对账：真机 Chrome 150 的 ClientHello
+  里没有 51764，Chrome 152 / 155 都有），`chrome145` / `chrome146` / `chrome150` 不该在
+  画像里宣称自己发它 —— 它们也没配信任锚列表，所以就算写了今天也发不出去，但那只是
+  "靠巧合正确"：哪天谁给它们配上锚，就会变成一条真机不存在的指纹。Firefox 从不发这个扩展。
+  `CURLOPT_TLS_TRUST_ANCHORS` 的载荷（28 项、排序后 186B）本来就是对的，之前只是没被发出来。
+- **HTTP/3 指纹结构对齐**（C/构建层，需重编 `deps/windows-prebuilt/{ngtcp2,nghttp3,curl-impersonate}`）：
+  - `deps/patches/ngtcp2.patch` 此前从未真正编译进库 → 现已在 `deps/sources/ngtcp2-src` 落地并重建，
+    恢复 `ngtcp2_conn_set_local_transport_params_raw()`；curl 侧重新接上预设的
+    `CURLOPT_QUIC_TRANSPORT_PARAMETERS` 原始字节。于是 QUIC 的 **transport parameter 顺序、
+    随机 GREASE TP、`0x3127/0x3128`、`version_information` 尾巴** 都与预设一致
+    （此前被 ngtcp2 按自己的规范顺序重编码、未知 TP 全丢，每次连接逐字节同构）。
+  - QUIC Initial 数据报 **1200B → 1250B**（`NGTCP2_MAX_UDP_PAYLOAD_SIZE`，与 Chrome 实测一致）。
+  - QUIC ClientHello 的**扩展顺序逐连接随机**（`openssl.c`：QUIC 下装了显式顺序表时
+    BoringSSL 的 permute 不生效，改成自己按 Fisher-Yates 洗一次，每个 SSL_CTX 一次 = 每条连接一次）。
+- **path 里的 `%XX` 不再被强制大写**（`lib/urlapi.c` 两处：`Curl_parse` 的 URL 规范化 + `curl_url_set`）：
+  `/a/%7euser` 现在与 Chrome 一样原样发出（此前会变成 `/a/%7Euser`）。
+  对**签名字段含 path 原串**的接口是硬需求。
+
+### 结论（不是 bug）：ECH GREASE 的长度是随机的，282 与 250 同源
+
+上一轮把「QUIC 282B vs TCP 250B」记成了遗留项。本轮核对后确认**两边本来就是同一套随机**：
+
+- BoringSSL `setup_ech_grease()`（`ssl/encrypted_client_hello.cc`）里
+  `payload_len = 32 × 随机{4,5,6,7} + aead_overhead(16)`，扩展体 = `payload_len + 42`，
+  所以整段只可能是 **186 / 218 / 250 / 282** 四种之一，每条连接重抽；
+- 本机 8 份真机 Chrome 抓包（`_archive/tls-analysis/` + `tools_diag/`）里
+  Chrome 实际出现过 payload **144 / 176 / 208 / 240**（四种全中，即上面四种长度全中）；
+- 因此 250 与 282 的差异是**单次抽样差异**，不是 QUIC/TCP 两条路径分叉。
+
+不改代码去「钉死」这个长度：Chrome 自己在变，钉死反而更假。
+
+### 构建
+
+- **CFFI 扩展的 include 目录指向了 9 月遗留副本**（`nb_curl/_cffi_build.py` /
+  `c_src/build/_cffi_build.py`）：之前用 `<项目根>/native/`，那里的 `nb_curl_bridge.h`
+  停在 9 月，缺 `nb_poll_item` / `nb_sock_info`，于是 `cl` 报一堆看不懂的语法错误
+  （`error C2143` / `C2061`）而不是缺符号。现在优先用真身 `<项目根>/c_src/native/`，
+  只在它不存在时回退旧路径。
+- 重建流程（本轮实际跑过的顺序）：
+  `build/windows/repack_curl_tar.sh`（把工作区改回收进源码包）→
+  `rebuild_curl.sh` → `build_all.sh`（native DLL + CFFI）→ `build_wheel.sh`。
+  **Git Bash 下调用 `cl.exe` 要先 `export MSYS2_ARG_CONV_EXCL='*'`**，否则 `/nologo`
+  这类开关会被 MSYS 改写成路径、编译出来的 DLL 全是乱的（本轮踩过）。
+- **Linux 轮子已重出**（manylinux_2_28，13.9 MB）：在构建机上的 `manylinux_2_28_x86_64`
+  容器里编（`build-linux/scripts/15_quic.sh` + `20_curl.sh` → `manylinux/build_bridge.sh` →
+  `build_cffi_linux.py` → `pip wheel` → `auditwheel repair`），BoringSSL/nghttp2 复用已有
+  prefix（同一个源码归档，哈希一致），只有 ngtcp2/nghttp3/curl 重编。产物
+  `nb_curl-0.3.2-py3-none-manylinux_2_28_x86_64.whl`，`.so` 的 GLIBC 符号上限 **2.28**
+  （Ubuntu 22.04+ / Debian 12+ / RHEL 9+ 可用）。
+
+### 验证
+
+| 套件 | 结果 |
+| --- | --- |
+| `tests/run_local_regression.py` | **264 条全过** |
+| `tests/test_browser_parity.py` | **64 条全过** |
+| `tests/test_parity_edges.py` | **33 条全过** |
+| `tests/test_stream_metadata.py` | **54 条全过** |
+| `tests/test_protocols.py` | **94 条全过**（cffi 与 ctypes 各跑一遍；新增 `http2.frames_custom` 16 条） |
+| `tests/test_async_protocols.py` | 21 过 / 1 失败（`h2.multi_concurrent_8`，与 0.3.1 基线同样失败，属既有多路复用缺口）/ 1 blocked（缺 `aioquic`） |
+| `tests/test_socket_changes.py` | **7 个用例全过** |
+
+QUIC 侧实测（`reports/gap-audit-2026/quiccap.py` 解 Initial，连抓 3 条连接）：
+`chrome155` 扩展数 **10 → 11**、`0xca34` 长度 **186B** 每次都在、扩展顺序每条连接都不同
+（`chrome145` / `chrome146` / `chrome150` 仍是 10 个扩展、没有 `0xca34`，与真机一致）；
+ECH GREASE 在同一批抓包里出现了 **282 / 186 / 218** 三种长度（我们自己也在随机），
+与 Chrome 的分布一致。
+
+### 已知遗留（仍未做）
+
+- QUIC 的 **GREASE 扩展**：`openssl.c` 对 QUIC 关掉了 `SSL_CTX_set_grease_enabled`
+  （curl-impersonate 的老决定）。真机 Chrome 155 的 QUIC ClientHello 抓包里也没看到
+  GREASE 扩展值，所以暂按"与真机一致"处理；哪天抓到 Chrome 在 H3 上带 GREASE，
+  这里要重新打开（`if(peer->transport == TRNSPRT_QUIC) ... 0`）。
+- QUIC 的 `version_information` 尾巴、GREASE TP 的**取值**每连接随机（Chrome 也随机），
+  但我们的随机源是 ngtcp2 的 `Curl_rand`，与 Chrome 的分布没有做过逐值比对。
+
+### 发布轮补充（2026-10-27，同一版本号的第二次交付）
+
+本轮只动文档与打包，**API 与网络行为零改动**（三个平台的轮子源码 AST 与上轮完全一致）。
+
+- **CFFI 扩展改名成稳定 ABI**：`_nb_curl_cffi.pyd`（Windows）/ `_nb_curl_cffi.abi3.so`（Linux），
+  名字里不再带 `cp311`。cffi 默认就按 `py_limited_api` 编译（Windows 只导入 `python3.dll`，
+  Linux 只引用 12 个 stable-ABI 符号），旧名字让 import 机制只在 3.11 上认它，
+  3.12+ 白回退 ctypes。改名后**同一份产物覆盖 3.9~3.14**，不必按版本各编一次。
+  实测：3.11 编的 `.pyd` 在 3.14 上、cp311 编的 `.abi3.so` 在 3.12 上都是 `backend=cffi`，
+  264 条回归全过。
+- **Windows 轮子补上 LICENSE**：`pyproject.toml` 改用 PEP 639（`license = "MIT"` +
+  `license-files = ["LICENSE"]`，`setuptools>=77`）。此前 win 的 `dist-info` 里只有
+  `License: MIT`、没有许可全文，linux 那份却有 —— 同版本两个轮子元数据不一致。
+  同时 `build_wheel.sh` 的暂存步骤补上 `LICENSE`（原来只拷了 README/pyproject/setup.py）。
+- **Linux 轮子瘦身**：桥接层链接加 `-Wl,--strip-debug`。`-g0` 只管自己那个 obj，
+  `libssl.a` / `libcrypto.a` / `ngtcp2` 等静态库成员里的 `.debug_*` 段会被整段链进 `.so`：
+  `libnb_curl_native.so` **37 MB → 5.0 MB**，wheel **13.9 MB → 3.6 MB**。
+- **两个轮子现在用同一份"发布版"源码**：win 一直走 `make_release.py`（去解释性注释、
+  保留 API docstring），linux 之前是直接在源码树上 `python -m build`，于是两边 `.py`
+  内容不同。本轮统一为"Windows 暂存目录 → 同步到 Linux → 两边各自打 wheel"，
+  两个轮子里的 `.py` 逐字节相同。
+- **README**：删掉 `trust_anchors`（51764）小节；`header_order` 改成两种写法各一例
+  （`diy_fp={"header_order": …}` 与顶层 `header_order=`）。
+
+### 验证（2026-10-27 发布轮，两个轮子都重打后实跑）
+
+| 套件 | Windows 轮子 | Linux 轮子 |
+| --- | --- | --- |
+| `tests/run_local_regression.py` | **264/264**（py3.11 + py3.14，均 `backend=cffi`） | **264/264**（宿主 py3.12 + 容器 cp311，均 `backend=cffi`） |
+| `tests/test_parity_edges.py` | 33/33 | 31/32 —— 唯一失败 `partial.body.error_keeps_read` 是**既有的偶发竞态**（旧轮子同样复现，3 次里 1 次），与本次改动无关 |
+| `tests/test_protocols.py` | 5/5（其余 blocked：缺 `h2`/`cryptography` 测试依赖） | 通过（H3 项 NOT-COVERED：无本地 H3 服务端） |
+| 冒烟（真实站点 `chrome155`） | ja4 `t13d1517h2_8daaf6152771_cb7bf5808d99`；H2/stream/async/cookie/WS/自定义 ja3/`http2_frames`/`tls_trust_anchors`/`header_order` 两种写法全通 | 同一 ja4，逐项同样通过 |
+| 打包校验 | `twine check` PASSED；`License-File` + `dist-info/licenses/LICENSE`；`.pyd` 无版本段 | `twine check` PASSED；RECORD 39 行无 mismatch；`License-File` 有；`.abi3.so`；GLIBC 上限 2.28 |
+
+体积：win 轮子 **1.87 MB**；linux 轮子 **3.61 MB**（上一轮 13.94 MB）。
+
+## [0.3.1] - 2026-10-23（HTTP 报文口径对齐 Chrome 155）
+
+**唯一标准是本机真机 Chrome 155.0.8059.85**（37 个 fetch/表单/iframe 场景 + 方法×3xx 矩阵 +
+h2 抓包 + 语义追问，见 `docs/16-curl_cffi修复对照审计.md` 第 10 节）。
+凡浏览器做不到的（重复请求头、GET 带 body、非 ISO-8859-1 头值）我们也不做；凡浏览器会做的
+（同名头 ", " 合并、URL 自动转义、303 全降级 GET、cookie 创建序…）我们就照做。
+
+### 变更（破坏性）
+
+- **同名请求头合并成一条**：`headers=[("X","1"),("X","2")]` 与 `{"X": ["1","2"]}` 都发 `X: 1, 2`。
+  实测 Chrome 155 根本发不出两行同名请求头（fetch 数组形式与 XHR 两次 setRequestHeader 都是 ", " 拼接）。
+- **URL 永远自动转义**（空格→`%20`，中文→`%E4%B8%AD`，已有 `%XX` 不动），与地址栏一致；
+  以前这种 URL 直接报 `curl 3 CURLE_URL_MALFORMAT`。没有 `quote=` 开关（浏览器也没有）。
+- **GET/HEAD 带 body 直接抛 `TypeError`**（Chrome：`Request with GET/HEAD method cannot have body`）。
+- **非 ISO-8859-1 头值抛 `TypeError`**（Chrome fetch/XHR 同样抛），不再静默发 UTF-8 字节。
+- **Content-Type 推断按浏览器**：`data=str` → `text/plain;charset=UTF-8`；二进制 → **不发**；
+  `data=dict` → `application/x-www-form-urlencoded`（表单提交口径，**不带** charset）；
+  无 body → 不发；`files=` → `multipart/form-data; boundary=----WebKitFormBoundary…`。
+- **响应头名字保持服务端原样**：`r.headers.keys() / items() / to_dict()` 用服务端给的原始大小写
+  （`Content-Type` 就是 `Content-Type`），重复值按 `", "` 合并；按名取值一直大小写不敏感。
+  浏览器的 `Headers` 会统一小写展示 —— 这一条**有意不同**：不改写用户看到的东西。
+- **删掉 6 个"浏览器里不存在"的 API**：`quote=`、`default_encoding=`、`raise_for_status=`、
+  `Response.is_redirect`、`cookies.set(...)`、`cookies.get_dict(...)`。
+  cookie 携带策略改用浏览器的 **`credentials="omit"`**（原 `discard_cookies=` 删除）。
+
+### 修复
+
+- **重定向方法矩阵与浏览器一致**（5 个方法 × 5 个 3xx 全实测）：301/302 只把 POST 降级为 GET；
+  303 除 HEAD 外全部降级为 GET（PUT/PATCH/DELETE 也是）；307/308 保留方法与 body。
+  POST/GET/HEAD 走 libcurl 原生语义；其余方法的 303 由 Python 侧逐跳跟（`history` / `redirect_count` 照常）。
+- **cookie 顺序**：创建序 + 长 path 在前（RFC 6265 5.4 / Chrome 实测）；同名不同 path 全都发。
+- **cookie 作用域**：`session.cookies[k]=v` 首次请求时绑到该主机（host-only），不跨站；
+  `Domain=` 不匹配拒收；`Secure` 只在安全上下文发（`https` / `localhost` / `127.0.0.1`，Chrome 同此）。
+- **cookie 删除**：`Max-Age=0` / 过期 `Expires` 罐里与线上同步删除（以前留"幽灵 cookie"）。
+- **HTTP/2 上 Cookie 仍是**一条**头**（实测 Chrome 155 不拆行；上一版按"Chrome 会拆"实现是错的，已撤）。
+- **尊重 `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE`**。
+- **`json()` 先按 UTF-8 解**，解不开才回退声明的 charset（Chrome 对 `application/json; charset=gbk`
+  会直接乱码，我们在这点上故意比它宽容）。
+
+### 构建
+
+- `build/windows/build_native.sh` 改指 `c_src/native/nb_curl_bridge.c`（仓库里 C 源码的真身；
+  `python/native/` 是 9 月的残留副本，不参与构建）。
+
+### 验证
+
+- 新增 `tests/test_browser_parity.py`（64 条断言，期望值全部来自真机 Chrome 抓包）。
+- 全量 492 条断言全绿：`run_local_regression` 264 + `test_browser_parity` 64 +
+  `test_parity_edges` 33 + `test_stream_metadata` 54 + `test_protocols` 77。
+
+### 已知差异（等你定）
+
+- `Origin` / `Referer` / `Cache-Control: max-age=0` / `Sec-Fetch-User` 这类头取决于**发起上下文**
+  （有没有来源页、是不是用户激活、是不是刷新）。我们的请求没有来源页，浏览器里没有等价场景，
+  所以暂不发；要补得先定义"我们的请求等价于浏览器的哪种发起方式"。
+- Linux wheel 需用同一份源码重出包。
 
 ## [0.3.1] - 2026-10-15
 
@@ -56,11 +268,59 @@ nb-curl 的版本变更记录。
   `timeout` / `connect_timeout` / `auth` / `ech` 从"有值"切到"无值"时显式复位（旧实现会残留到下一次请求）；
   连接分区把 `proxy=None`（跟随环境变量）与 `proxy=""`（显式禁用）分开。
 
+### 修复
+
+- **报错文案统一单行**（回归用例 `errors.one_line`）：以前 97 / 52 这类错误的附加信息
+  （`代理子原因 …`、`本次请求走了代理 …`）会另起一行并缩进两格，日志里一行 ERROR 被撑成
+  三行，"一大坨"把上下文挤走。现在这些信息改用 `；` 接在同一行（细节一个字没删，
+  错误码手册链接仍在），并对 libcurl 原始信息里残留的 CR/LF / 连续空白做折叠 ——
+  `str(exc)` 保证不含换行。
+- **WebSocket 对端不发 CLOSE 直接断开时不再抛 `NameError`**：`ws.py` 用了没有导入的
+  `CURLE_GOT_NOTHING`，该分支现在按文档语义返回 `None`（`recv()` 视为连接已结束）。
+- **`AsyncSession.close()` 的"补一次有界等待"真正生效**：`aio.py` 引用了未定义的
+  `_STREAM_REACTOR_GRACE`，异常被 `except Exception` 吞掉，等于没有这一步；
+  现从 `session` 导入该常量（5.0 秒），与 `Session.close()` 的等待预算一致。
+- **`diy_fp={"http2_headers_priority": ...}` 不再被静默忽略**：`parse_diy_fp` 漏了赋值，
+  传 `True` / `False` 都没有效果；现在按预期下发。与 `http2_no_priority=True` 同时给时会在
+  请求发出前抛 `FingerprintError`（互斥校验本来就有，之前因为字段永远没被赋值而触发不到）。
+- **`curl_options` 的取值说明与报错文案改掉误导写法**：`nb_curl.options` 这个名字在本包里是
+  HTTP 的 OPTIONS **函数**（requests 习惯，遮蔽了同名子模块），原来的
+  `nb_curl.options.SAFE_OPTIONS` 取不到；文档与 `ValueError` 文案统一改为
+  `nb_curl.CurlOpt` / `from nb_curl.options import ...`。**公开 API 未变。**
+- **取值范围自省的条目数对齐实际**：`tls.supported_ciphers()` 的说明由"37 个"改为 **34 个**
+  （37 是含 TLS1.3 的联合表条数），`tls.supported_extensions()` 由"31 个"改为 **32 个**。
+- **显式给的 cookie 不再被重排**（回归用例 `cookies.order`）：以前
+  `headers={"Cookie": "uin=; p_uin=; p_uid=; TRACE=…"}` 和 `cookies={...}` 都只是把 cookie
+  塞进 libcurl 的 cookie 引擎，而引擎在拼请求头之前会按
+  `path 长度 > domain 长度 > name 长度 > 创建时间` 重排（`lib/cookie.c: cookie_sort`），
+  线上就成了 `Cookie: TRACE=…; p_uid=; p_uin=; uin=` —— 按 cookie 出现顺序校验的站点直接判失败。
+  现在显式 cookie 由 `CookieJar.header_value()` 按**给进来的顺序**拼成一条 `Cookie: …` 头
+  （会话罐里命中该主机 / 路径 / `Secure` 作用域的 cookie 按罐内顺序跟在后面，同名不重复），
+  此时 cookie 引擎本次清空静默（仍照常记录响应的 `Set-Cookie`，临时 cookie 依旧不进会话罐）。
+- **`Cookie` 头只发一条、值逐字节原样、位置跟着 `headers=` 走**（回归用例 `cookies.order`
+  与 `http2.cookie_header`）：
+  - **一条**：curl-impersonate 的每个预设都开着 `split_cookies`，HTTP/2 下 libcurl 会把
+    `Cookie: a=1; b=2` 拆成两条 `cookie` 头（`lib/http.c` 的 `http_cookies` split 分支）。
+    按 RFC 9113 §8.2.3 接收方应当用 `"; "` 拼回去，但现实里大量服务端/中间件按"同名头覆盖"
+    处理，整串登录态只剩最后一条。本版把 `CURLOPT_SPLIT_COOKIES` 默认置 0，cookie 永远一条头。
+    这条**只影响引擎那一路**（会话罐）：显式 `Cookie` 头本来就是一条真实 header 行，不走引擎。
+  - **原样**：显式串不再"解析成 pairs 再拼回"，多余空格、重复名、空值（`uin=`）、
+    大小写、末尾分号都不改写（只有行首尾空白按 HTTP 语义去掉）。
+  - **位置**：以前显式 cookie 走 `CURLOPT_COOKIE`，那是 libcurl 自己在 header 块里**补**一条
+    `Cookie:`（`http_cookies()` 写在自定义头之前），所以永远排在 Host 之后第一条，
+    `headers=` 里的位置完全无效。现在它就是 `headers` 里的一条普通行 ——
+    写在最后就发在最后；只给 `cookies=` 时追加在用户头的末尾。
+  - 想要浏览器式拆行（Firefox 在 h2 上就是一条 cookie 一对）仍可显式打开：
+    `diy_fp={"split_cookies": True}`（作用于引擎/会话罐那一路）。
+
 ### 验证
 
 - 本机回归：两个 FFI 后端（cffi / ctypes）× 15 个套件全部通过，含协议、HTTP/3、平价边界、
   流式元数据与 6 个 smoke 套件；指纹评分与真机 Chrome 155 逐项对齐（第三方检测站 95 / 100，
   与 `0.3.0` 相同，扣分项仍是 ECH 一项）。
+- 上述修复后重跑 `tests/run_local_regression.py`（cffi 后端、262 项断言）：**262 通过 / 0 失败**；
+  `tests/test_protocols.py --only http2`（含新增 `http2.cookie_header`）在 cffi / ctypes 两个后端
+  上均全绿。
 
 ## [0.3.0] - 2026-09-24
 

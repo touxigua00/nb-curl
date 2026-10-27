@@ -19,7 +19,7 @@ print(r.status_code, r.http_version)   # 200 2
 pip install nb-curl
 
 # 或下载 wheel 手动装（Releases 页有 Windows x64 / Linux manylinux_2_28 x86_64）
-pip install nb_curl-0.3.1-py3-none-win_amd64.whl
+pip install nb_curl-0.3.2-py3-none-win_amd64.whl
 ```
 
 支持平台：Windows x64、Linux x86_64（`manylinux_2_28`）。
@@ -306,54 +306,60 @@ nb_curl.get(url, impersonate="chrome150", diy_fp={
 
 可用键见 `nb_curl.diy_fp_fields()`，拼错会直接报错，不会静默忽略。
 
-#### `header_order` —— 自定义请求头顺序（host 永远在最前）
+#### `diy_fp={"http2_frames": ...}` —— HTTP/2 帧整帧自定义
 
-`diy_fp={"header_order": ...}` 决定**普通请求头**的发送顺序，字符串和列表两种写法都行
-（列表更方便，不用自己拼逗号）：
+Akamai HTTP/2 指纹四件套（SETTINGS 条目与顺序、连接级 WINDOW_UPDATE、PRIORITY 帧、
+伪头顺序）一次改完。两种写法等价：
 
 ```python
-# 列表写法
+# 字典写法：settings 收 {"名称": 值} 或 "id:value;..." 字符串，按写入顺序发出
+nb_curl.get(url, impersonate="chrome155", http_version="2", diy_fp={
+    "http2_frames": {
+        "settings": {
+            "HEADER_TABLE_SIZE": 65536,
+            "ENABLE_PUSH": 0,
+            "INITIAL_WINDOW_SIZE": 6291456,
+            "MAX_HEADER_LIST_SIZE": 262144,
+        },
+        "window_updates": {"0": 15663105},   # 只有连接级（流 0）
+        "order": "m,a,s,p",                  # 伪头顺序；也收 "masp" / ["m","a","s","p"]
+        # "priority": "1:0:0:201",          # 可选：PRIORITY 帧，写 0 / 不写 = 不发
+    }})
+
+# 字符串写法：SETTINGS|WINDOW_UPDATE|PRIORITY|ORDER（与 akamai= 同格式）
+nb_curl.get(url, impersonate="chrome155", http_version="2", diy_fp={
+    "http2_frames": "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p"})
+```
+
+取值即时校验：未知设置名、值越界、`window_updates` 给了非 0 的流、`order` 不是
+`m/a/s/p` 的排列、字符串段数不对 —— 都直接抛 `FingerprintError`。
+它与 `akamai=` 指向同一批开关，混用时 `diy_fp` 后合并、以它为准；
+HEADERS 帧里那 5 个废弃优先级字段仍归 `http2_headers_priority` / `http2_stream_weight`。
+
+#### `header_order` —— 自定义请求头顺序（host 永远在最前）
+
+`header_order` 决定**普通请求头**的发送顺序。它既是 `diy_fp` 的一个字段，也是与
+`impersonate` 同级的顶层参数，两种写法等价：
+
+```python
+# 1) 写进 diy_fp
 nb_curl.get(url, impersonate="chrome155", diy_fp={
     "header_order": ["sec-ch-ua", "user-agent", "accept"]})
 
-# 字符串写法等价
-nb_curl.get(url, impersonate="chrome155", diy_fp={
-    "header_order": "sec-ch-ua,user-agent,accept"})
+# 2) 直接作为顶层参数（压过预设与 diy_fp 里的同名项）
+nb_curl.get(url, impersonate="chrome155", 
+    header_order=["sec-ch-ua", "user-agent", "accept"])
 ```
 
+取值收列表，也收逗号分隔字符串（`"sec-ch-ua,user-agent,accept"`），大小写不敏感、重复名只留一份。
 规则（HTTP/1.1 与 HTTP/2 都生效）：
 
 * 名单里的头**按你给的顺序**排到最前，没列出的头保持原相对顺序追加在后；
 * **`host` 永远排第一个**：名单里没写会自动补在最前，写在别处会被提上来
-  （不这样做的话 `host` 会掉进"其余"那组，跑到末尾）；
-* 头名大小写不敏感，重复项只保留一份。
+  （不这样做的话 `host` 会掉进"其余"那组，跑到末尾）。
 
 > 注意：名单里的头必须**真的在请求里存在**才有意义（`header_order` 只负责排序，
 > 不会凭空造出一个头）。要让某个头出现在指定位置，请同时用 `headers=` 传它。
-
-#### `trust_anchors`（扩展 51764）—— 内置预设已带，也能单独换
-
-Chrome 的 ClientHello 多了一个 `trust_anchors(51764)` 扩展，载荷是 Chrome 内置根存储里
-每张根证书的编号。**`chrome155` 预设默认就发这 28 项**（顺序与真 Chrome 155 逐字节相同），
-你什么都不用配；要换一份时，和 `tls_signature_algorithms` 一样走 `diy_fp` 单独给：
-
-```python
-# 默认：自带 Chrome 的 28 项
-nb_curl.get(url, impersonate="chrome155")
-
-# 换成自己的列表（逗号分隔的十进制点分 OID），按你给的顺序原样发出
-nb_curl.get(url, impersonate="chrome155",
-            diy_fp={"tls_trust_anchors": "52580.200109.1.10,11129.9.1"})
-
-# 显式发空列表（线格式 "0000"，和"扩展不存在"不是一回事）
-nb_curl.get(url, impersonate="chrome155",
-            diy_fp={"tls_trust_anchors": ""})
-```
-
-显式给的列表**整份替换**预设那份（不是追加），顺序也由你决定：真 Chrome 是按
-RELATIVE-OID 编码字节排序后固定发出的，同一版本每次连接 186 字节全同 —— 本库同样
-不重排、不洗牌。想确认线上到底发了什么，用一个"只收不答"的本地监听截下第一条
-ClientHello，再解 51764 的载荷即可（`nb_curl.tls.TLS_EXTENSIONS[51764]` 就是这个扩展）。
 
 #### `fp_file` —— 一键复刻真实浏览器（最省事）
 
@@ -389,7 +395,7 @@ nb_curl.get(url, fp_file="real_chrome.json", impersonate="chrome155")
 不确定某个值是否合法，用 `nb_curl.tls` 查（全部离线可用）：
 
 ```python
-nb_curl.tls.supported_ciphers()                # 37 个密码套件
+nb_curl.tls.supported_ciphers()                # 34 个密码套件（TLS1.2 及以下）
 nb_curl.tls.supported_tls13_ciphers()
 nb_curl.tls.supported_groups()                 # 9 个曲线/协商组
 nb_curl.tls.supported_signature_algorithms()   # 16 个签名算法
@@ -443,12 +449,11 @@ TLS 指纹只在**建立连接**时生效，连接一旦建立就固定了。nb-
 
 **Q：超时、请求头写错、域名解析不了……怎么全都报 `proxy handshake error`（curl 97）？**
 因为 97 是**代理握手失败**，而握手发生在请求发出之前 —— 后面那些问题还没轮到就被它盖住了。
-换句话说：不是报错不准，是每次请求都倒在代理那一步。看报错文案补的两行即可定位：
+换句话说：不是报错不准，是每次请求都倒在代理那一步。看报错文案里同一行补的
+「代理子原因 / 本次请求走了代理」即可定位（**整条报错始终单行**，不换行）：
 
 ```text
-proxy handshake error (curl 97 CURLE_PROXY，…)
-  代理子原因 2 CURLPX_BAD_VERSION，对端回的版本号不是 SOCKS4/5，该端口多半不是代理或代理类型配错了
-  本次请求走了代理 ALL_PROXY=socks5://127.0.0.1:1080；若不是本意，传 proxy="" 显式禁用，…
+proxy handshake error (curl 97 CURLE_PROXY，…，错误码说明请参考：https://curl.se/libcurl/c/libcurl-errors.html)；代理子原因 2 CURLPX_BAD_VERSION，对端回的版本号不是 SOCKS4/5，该端口多半不是代理或代理类型配错了；本次请求走了代理 ALL_PROXY=socks5://127.0.0.1:1080；若不是本意，传 proxy="" 显式禁用，…
 ```
 
 常见原因是代理地址写错、协议配错（把 HTTP 代理当 SOCKS 用），或环境变量

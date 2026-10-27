@@ -33,7 +33,12 @@ mkdir -p "$LIBDIR"
 
 c_info "编译 libnb_curl_native.so ..."
 
-gcc -shared -fPIC -O2 -g0 \
+# -Wl,--strip-debug：只关自己的调试信息是不够的。-g0 只作用于本文件的 obj，
+# 而 libssl.a / libcrypto.a / libngtcp2.a 等静态库成员里带着完整的 .debug_* 段，
+# 链接成 .so 后会被整段带出来（实测 37 MB 里有 32 MB 是 .debug_info 这些段，
+# wheel 因此虚高到 13.9 MB）。--strip-debug 在链接期丢掉这些段，
+# 保留 .symtab（函数名还在，crash 时仍可对栈），比事后 strip 更稳。
+gcc -shared -fPIC -O2 -g0 -Wl,--strip-debug \
   -D_GNU_SOURCE -DCURL_STATICLIB \
   -I"$PREFIX/include" \
   -I"$NATIVE_DIR" \

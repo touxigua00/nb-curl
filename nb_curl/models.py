@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import calendar
 import json as _json
 import re
 import threading
+import time
 from datetime import timedelta
 from typing import Any, Iterable, Iterator, Mapping
 
@@ -35,15 +37,20 @@ class Headers:
 
     # -- 基础 ------------------------------------------------------------ #
     def get(self, key: str, default: Any = None) -> Any:
+        """同名重复头按 ", " 合并后返回（与浏览器 ``Headers`` / requests 一致）。"""
         key_l = key.lower()
-        for name, value in self._items:
-            if name.lower() == key_l:
-                return value
-        return default
+        found = [value for name, value in self._items if name.lower() == key_l]
+        if not found:
+            return default
+        return found[0] if len(found) == 1 else ", ".join(found)
 
     def get_list(self, key: str) -> list[str]:
         key_l = key.lower()
         return [v for n, v in self._items if n.lower() == key_l]
+
+    def raw_items(self) -> list[tuple[str, str]]:
+        """原始大小写 + 原始顺序的 (name, value) 列表（调试用；对外一律小写）。"""
+        return list(self._items)
 
     def __getitem__(self, key: str) -> str:
         value = self.get(key)
@@ -55,29 +62,43 @@ class Headers:
         return self.get(key) is not None
 
     def __iter__(self) -> Iterator[str]:
-        return (name for name, _ in self._items)
+        return iter(self.keys())
 
     def __len__(self) -> int:
-        return len(self._items)
+        return len(self.keys())
 
     def keys(self) -> list[str]:
-        return [name for name, _ in self._items]
+        """唯一键，**大小写按服务端原样**（同一个头的多种写法取第一次出现的那个）。"""
+        order: list[str] = []
+        seen: set[str] = set()
+        for name, _value in self._items:
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                order.append(name)
+        return order
 
     def values(self) -> list[str]:
-        return [value for _, value in self._items]
+        return [value for _name, value in self.items()]
 
     def items(self) -> list[tuple[str, str]]:
-        return list(self._items)
+        """每个头一条：名字用服务端原大小写，重复值按 ", " 合并。
+
+        大小写**不改写**（服务端发 ``Content-Type`` 就是 ``Content-Type``）；需要按名取值
+        一律走大小写不敏感的 :meth:`get` / :meth:`get_list` / ``[]``。
+        """
+        out: dict[str, list[str]] = {}
+        for name, value in self._items:
+            key = name.lower()
+            if key in out:
+                out[key][1] = out[key][1] + ", " + value
+            else:
+                out[key] = [name, value]
+        return [(name, value) for name, value in out.values()]
 
     def to_dict(self) -> dict[str, str]:
-        """重复头用 ", " 合并（与 requests 的 dict 视图一致）。"""
-        out: dict[str, str] = {}
-        for name, value in self._items:
-            if name in out:
-                out[name] = out[name] + ", " + value
-            else:
-                out[name] = value
-        return out
+        """同 :meth:`items`，返回 dict（键保持服务端大小写）。"""
+        return dict(self.items())
 
     def __eq__(self, other: Any) -> bool:
         if isinstance(other, Headers):
@@ -91,10 +112,23 @@ class Headers:
 
 
 class Cookies(dict):
-    """Cookie 容器，也可通过 ``get_dict`` 拿到扁平字典。"""
+    """响应里的 cookie 视图：``name -> value``，另外记住每条的 domain/path。
 
-    def get_dict(self, domain: str | None = None, path: str | None = None) -> dict[str, str]:
+    ``get_dict(domain=, path=)`` 可以按作用域过滤（对齐 curl_cffi）；
+    ``set(...)`` 只是让迁移过来的代码不报错（改响应对象不会回写会话罐）。
+    """
+
+    def __init__(self, items: Mapping[str, Any] | None = None,
+                 meta: Mapping[str, Mapping[str, Any]] | None = None):
+        super().__init__(items or {})
+        self._meta: dict[str, dict[str, Any]] = {k: dict(v) for k, v in (meta or {}).items()}
+
+    def get_dict(self) -> dict[str, str]:
+        """扁平副本（浏览器没有这个概念，留着只是把它当普通 dict 用）。"""
         return dict(self)
+
+    def __repr__(self) -> str:
+        return "Cookies(%r)" % (dict(self),)
 
 
 # --------------------------------------------------------------------------- #
@@ -125,12 +159,11 @@ def _netscape_cookie_line(domain: str, tailmatch: bool, path: str, name: str,
     )
 
 
-def parse_cookie_line(line: str) -> tuple[tuple[str, str, bool, str], str, int] | None:
-    """解析一行 Netscape cookie，返回 ``(作用域键, 值, 过期时间)``。
+def _cookie_line_fields(line: str) -> tuple[tuple[str, str, bool, str], bool, int, str] | None:
+    """解析一行 Netscape cookie，返回 ``(作用域键, secure, 过期时间, 值)``。
 
-    作用域键 = ``(name, domain, tailmatch, path)`` —— 与引擎判断"是不是同一条
-    cookie"的维度一致，也是本模块做增量下发的比较单位。不是 cookie 行（注释、
-    空行、字段不足）返回 ``None``。
+    作用域键 = ``(name, domain, tailmatch, path)``。不是 cookie 行（注释、空行、
+    字段不足）返回 ``None``。
     """
     if line.startswith("#HttpOnly_"):
         line = line[10:]
@@ -139,7 +172,7 @@ def parse_cookie_line(line: str) -> tuple[tuple[str, str, bool, str], str, int] 
     fields = line.rstrip("\r\n").split("\t")
     if len(fields) < 6:
         return None
-    domain, tailmatch, path, _secure, expires, name = fields[:6]
+    domain, tailmatch, path, secure, expires, name = fields[:6]
     value = fields[6] if len(fields) > 6 else ""
     try:
         expires_at = int(expires or 0)
@@ -147,7 +180,177 @@ def parse_cookie_line(line: str) -> tuple[tuple[str, str, bool, str], str, int] 
         expires_at = 0
     key = (name, domain.lstrip(".").lower(),
            tailmatch.strip().upper() == "TRUE", path or "/")
+    return key, secure.strip().upper() == "TRUE", expires_at, value
+
+
+def parse_cookie_line(line: str) -> tuple[tuple[str, str, bool, str], str, int] | None:
+    """解析一行 Netscape cookie，返回 ``(作用域键, 值, 过期时间)``。
+
+    作用域键 = ``(name, domain, tailmatch, path)`` —— 与引擎判断"是不是同一条
+    cookie"的维度一致，也是本模块做增量下发的比较单位。不是 cookie 行（注释、
+    空行、字段不足）返回 ``None``。
+    """
+    parsed = _cookie_line_fields(line)
+    if parsed is None:
+        return None
+    key, _secure, expires_at, value = parsed
     return key, value, expires_at
+
+
+def _domain_matches(host: str, domain: str, tailmatch: bool) -> bool:
+    """``host`` 是否落在 cookie 的 domain 作用域内（RFC 6265 5.1.3 的简化版）。"""
+    host = (host or "").lower()
+    domain = (domain or "").lower().lstrip(".")
+    if not domain:                      # 没有 domain 的行 = 对所有主机生效
+        return True
+    if host == domain:
+        return True
+    return bool(tailmatch) and host.endswith("." + domain)
+
+
+def _path_matches(request_path: str, cookie_path: str) -> bool:
+    """``request_path`` 是否落在 cookie 的 path 作用域内（RFC 6265 5.1.4）。"""
+    request_path = request_path or "/"
+    cookie_path = cookie_path or "/"
+    if cookie_path == "/" or request_path == cookie_path:
+        return True
+    if not request_path.startswith(cookie_path):
+        return False
+    return cookie_path.endswith("/") or request_path[len(cookie_path)] == "/"
+
+
+def _default_path(request_path: str) -> str:
+    """RFC 6265 5.1.4 的默认 Path：请求路径去掉最后一段（没有斜杠就用 "/"）。"""
+    path = request_path or "/"
+    if not path.startswith("/"):
+        return "/"
+    cut = path.rfind("/")
+    return "/" if cut <= 0 else path[:cut]
+
+
+# 「可信来源」白名单：与 Chrome 一致 —— https，以及 localhost / 环回地址
+# （它们本身就被当作 secure context，所以 Secure cookie 在 http://localhost 上也能读写）。
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def is_secure_origin(scheme: str, host: str) -> bool:
+    """当前请求是否算「安全上下文」（决定 Secure cookie 发不发）。"""
+    if (scheme or "").lower() in ("https", "wss"):
+        return True
+    name = (host or "").lower().strip("[]")
+    return name in _LOCAL_HOSTS or name.endswith(".localhost")
+
+
+_EXPIRES_FORMATS = (
+    "%a, %d %b %Y %H:%M:%S GMT",
+    "%a, %d-%b-%Y %H:%M:%S GMT",
+    "%a, %d %b %Y %H:%M:%S",
+    "%a, %d-%b-%Y %H:%M:%S",
+    "%a %b %d %H:%M:%S %Y",
+)
+
+
+def _parse_cookie_date(value: str) -> float | None:
+    """把 ``Expires`` 值解析成 UTC 时间戳；解析不了返回 ``None``。
+
+    用 ``calendar.timegm``（纯 UTC 算术）而不是 ``time.mktime``：后者在 Windows 上
+    对 1970 前后/越界日期会抛 ``OverflowError``，而 ``Expires=Thu, 01 Jan 1970``
+    正是"删除 cookie"最常用的写法。
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    # 浏览器容忍 weekday 缺失/大小写混杂，这里先去掉星期几再按几种格式试
+    candidates = [text, text.split(",", 1)[-1].strip()]
+    for cand in candidates:
+        for fmt in _EXPIRES_FORMATS:
+            try:
+                parsed = time.strptime(cand, fmt)
+            except ValueError:
+                continue
+            try:
+                return float(calendar.timegm(parsed))
+            except (OverflowError, ValueError):
+                return 0.0
+    return None
+
+
+def parse_set_cookie(value: str, request_host: str, request_path: str,
+                     now: float | None = None) -> dict[str, Any] | None:
+    """解析一条 ``Set-Cookie`` 值（RFC 6265 5.2）。
+
+    返回 ``{"name", "value", "domain", "tailmatch", "path", "secure",
+    "httponly", "expires"}``；``expires`` <= ``now`` 表示这条 cookie 已被删除。
+    域不匹配（Domain 不是 host 的后缀）返回 ``None``。
+    """
+    now = time.time() if now is None else float(now)
+    text = (value or "").strip()
+    if not text:
+        return None
+    first, _, attrs = text.partition(";")
+    name, sep, val = first.partition("=")
+    name, val = name.strip(), val.strip()
+    if not sep or not name:
+        return None
+
+    domain = ""
+    tailmatch = False
+    path = ""
+    secure = False
+    httponly = False
+    expires: float | None = None
+    host_l = (request_host or "").lower()
+
+    for item in attrs.split(";"):
+        key, _, raw = item.partition("=")
+        key = key.strip().lower()
+        raw = raw.strip()
+        if key == "expires":
+            parsed = _parse_cookie_date(raw)
+            if parsed is not None:
+                expires = parsed
+        elif key == "max-age":
+            try:
+                delta = int(raw)
+            except ValueError:
+                continue
+            expires = now + delta
+        elif key == "domain":
+            candidate = raw.lstrip(".").lower().strip("[]")
+            if not candidate:
+                continue
+            # Domain 必须是 host 的后缀（且不能是裸顶级域），否则整条拒收
+            if host_l == candidate or host_l.endswith("." + candidate):
+                if "." in candidate or candidate in _LOCAL_HOSTS:
+                    domain = candidate
+                    tailmatch = True
+                else:
+                    return None
+            else:
+                return None
+        elif key == "path":
+            path = raw or "/"
+        elif key == "secure":
+            secure = True
+        elif key == "httponly":
+            httponly = True
+
+    if not domain:
+        domain = host_l                      # host-only cookie
+        tailmatch = False
+    if not path or not path.startswith("/"):
+        path = _default_path(request_path)
+
+    return {
+        "name": name,
+        "value": val,
+        "domain": domain,
+        "tailmatch": tailmatch,
+        "path": path,
+        "secure": secure,
+        "httponly": httponly,
+        "expires": expires,
+    }
 
 
 def expired_cookie_line(key: tuple[str, str, bool, str]) -> str:
@@ -156,39 +359,75 @@ def expired_cookie_line(key: tuple[str, str, bool, str]) -> str:
     return _netscape_cookie_line(domain, tailmatch, path, name, "", expires=1)
 
 
+def _cookie_names(value: str) -> set[str]:
+    """从一条 ``Cookie`` 头值里认出 cookie 名（**只用于去重，不改写原文**）。
+
+    用户给的整串在线上是原样发出的，这里只解析"占了哪些名字"，好让会话罐里的
+    同名 cookie 不再追加一份。
+    """
+    names: set[str] = set()
+    for item in str(value).split(";"):
+        name = item.split("=", 1)[0].strip()
+        if name:
+            names.add(name)
+    return names
+
+
 class CookieJar(dict):
-    """``session.cookies``：``name -> value`` 的表面视图 + 引擎要用的带作用域行。
+    """``session.cookies``：``name -> value`` 的表面视图 + 浏览器口径的完整罐。
 
-    引擎（libcurl 的 cookie engine）是**唯一**能把 cookie 拼进 ``Cookie:`` 请求头
-    的通道。早先把同一份 jar 又用 ``CURLOPT_COOKIE`` 给了一遍，于是引擎自己从
-    ``Set-Cookie`` 学到的 cookie 会被拼两次（``Cookie: sid=x; sid=x``）——既是功能
-    问题，也是可被识别的指纹特征。现在只留引擎一条路，本类负责三件事：
+    设计目标只有一个：**发出去的 ``Cookie`` 头与真浏览器逐字节一致**。
 
-    * ``_lines``：带 domain/path/secure/过期时间的规范 cookie 行（会话级 jar，
-      由引擎导出后吸收而来，可直接推给另一只 handle 的引擎，往返无损）；
-    * ``_explicit``：用户显式给的 ``name=value``（还没有作用域，下发时按本次请求的
-      主机补上 —— 与浏览器给"没有 Domain 属性的 cookie"的作用域规则一致）；
-    * 表面仍是 ``dict``：``session.cookies["k"] = "v"`` / ``dict(session.cookies)``
-      这些老写法照旧可用。显式赋值会被记进 ``_explicit``，删掉它则会在下一次请求时
-      把对应 cookie 从引擎里一并删掉。
+    * **发送**：请求头里的 ``Cookie`` 一律由 :meth:`header_value` 拼（显式 cookie 在
+      前、罐内 cookie 在后，罐内按 RFC 6265 5.4 排序：path 长者先、同长按创建时间），
+      再作为一条普通 header 行下发；内建 cookie 引擎在发送前被清空，绝不让它拼第二
+      条（它按 ``path/domain/name`` **长度**排序，与浏览器口径不同）。
+    * **学习**：引擎仍然开着，响应里的 ``Set-Cookie`` 照常被它学到，收尾时经
+      :meth:`_absorb` 吸收进罐；删除（``Max-Age=0`` / 过期 ``Expires``）另外由
+      :meth:`remember_set_cookie` 从原始头里解析确认 —— 引擎被清空过，删不到它不
+      认识的行。
+    * **作用域**：脚本里直接 ``session.cookies["k"] = "v"`` 没有 domain 信息，第一次
+      真正发请求时按"当前主机"绑成 host-only（浏览器对没有 Domain 属性的 cookie 就
+      是这个语义），因此不会跨站泄漏；要显式指定作用域用 :meth:`set`。
+    * **创建时间**：本类自己维护一个单调序号（第一次见到这条 cookie 的时刻），
+      引擎改写 value 时序号保持不变 —— 与 RFC 6265 "更新不重置创建时间" 一致。
     """
 
     def __init__(self, items: Mapping[str, Any] | None = None):
         super().__init__()
-        # 复合操作锁：_absorb/_wanted/_prune 是"读-改-写"的复合操作，并发请求
-        # （cookies.concurrent 回归）同时吸收各自引擎导出会互相踩 —— 每一步都
-        # 必须整体持锁，而不是只锁单条 dict 赋值。
-        self._lock = threading.Lock()
+        # 复合操作锁：_absorb/_prune/_candidates 是"读-改-写"的复合操作，并发请求
+        # 同时吸收各自引擎导出会互相踩 —— 每一步都整体持锁。
+        self._lock = threading.RLock()
         self._lines: dict[tuple[str, str, bool, str], str] = {}
-        self._explicit: dict[str, str] = {}
+        self._seq: dict[tuple[str, str, bool, str], int] = {}
+        self._counter = 0
+        self._explicit: dict[str, Any] = {}
+        self._explicit_host: dict[str, str] = {}
         for name, value in dict(items or {}).items():
             self[name] = value
 
-    # -- 用户写入：记为"显式"，需要按请求主机补作用域后下发 ---------------- #
+    # -- 内部 ------------------------------------------------------------- #
+    def _next_seq(self) -> int:
+        self._counter += 1
+        return self._counter
+
+    def _drop_key(self, key: tuple[str, str, bool, str]) -> None:
+        """删掉一条作用域行；该名字再没有别的行时，表面视图也一起清掉。"""
+        self._lines.pop(key, None)
+        self._seq.pop(key, None)
+        name = key[0]
+        if not any(k[0] == name for k in self._lines):
+            self._explicit.pop(name, None)
+            self._explicit_host.pop(name, None)
+            dict.pop(self, name, None)
+
+    # -- 用户写入：记为"未绑定"，第一次发请求时绑到当前主机 ---------------- #
     def __setitem__(self, name: str, value: Any) -> None:
         key = str(name)
-        self._explicit[key] = value
-        dict.__setitem__(self, key, value)
+        with self._lock:
+            self._explicit[key] = value
+            self._explicit_host.pop(key, None)
+            dict.__setitem__(self, key, value)
 
     def update(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
         for name, value in dict(*args, **kwargs).items():
@@ -213,15 +452,19 @@ class CookieJar(dict):
     def clear(self) -> None:
         with self._lock:
             self._explicit.clear()
+            self._explicit_host.clear()
             self._lines.clear()
+            self._seq.clear()
             dict.clear(self)
 
     def _forget(self, name: str) -> None:
         """用户删掉一个 cookie：显式记录 + 所有作用域下的同名行全部作废。"""
         with self._lock:
             self._explicit.pop(name, None)
+            self._explicit_host.pop(name, None)
             for key in [k for k in self._lines if k[0] == name]:
-                del self._lines[key]
+                self._lines.pop(key, None)
+                self._seq.pop(key, None)
 
     # -- 引擎侧（只在 session 内部用） ------------------------------------ #
     def _absorb(self, dump: str, now: float,
@@ -229,10 +472,8 @@ class CookieJar(dict):
         """吸收一次引擎导出（``CURLINFO_COOKIELIST`` 的原始文本）。
 
         ``skip`` 是本次请求专用的作用域键（显式 ``Cookie`` 头转来的，用完即弃），
-        不能被记进会话罐。
-
-        过期键删除是**幂等 pop**：并发请求可能已经先吸收了同一条过期通知，
-        ``del`` 会 KeyError（cookies 回归双后端复现的 2 断言失败），``pop`` 不会。
+        不能被记进会话罐。过期键删除是**幂等 pop**：并发请求可能已经先吸收了同一条
+        过期通知。
         """
         with self._lock:
             for line in dump.splitlines():
@@ -242,29 +483,129 @@ class CookieJar(dict):
                 key, value, expires_at = parsed
                 name = key[0]
                 if expires_at and expires_at <= now:
-                    # 引擎里已经过期删掉了，表面视图也别再留着（幂等：可能已被
-                    # 并发请求吸收同一条过期通知时删掉）
-                    self._lines.pop(key, None)
-                    if not any(k[0] == name for k in self._lines):
-                        self._explicit.pop(name, None)
-                        dict.pop(self, name, None)
+                    self._drop_key(key)
                     continue
+                if key not in self._lines:
+                    self._seq[key] = self._next_seq()      # 新 cookie：创建序 = 现在
                 self._lines[key] = line
-                if self._explicit.get(name) not in (None, value):
-                    # 服务端改了同名 cookie：引擎里的值才是权威，别再用我们那份覆盖它
-                    self._explicit.pop(name, None)
+                self._explicit.pop(name, None)
+                self._explicit_host.pop(name, None)
                 dict.__setitem__(self, name, value)
 
+    def remember_set_cookie(self, header_value: str, host: str, request_path: str,
+                            now: float | None = None) -> None:
+        """从响应原始 ``Set-Cookie`` 里确认**删除**（引擎被清空过，删不到它不认识的）。
+
+        新增/更新照旧由引擎导出负责（作用域语义与 libcurl 完全一致），这里只处理
+        ``Max-Age=0`` / 已过期 ``Expires`` 这类"删掉罐里已有的那条"的情况。
+        """
+        now = time.time() if now is None else float(now)
+        parsed = parse_set_cookie(header_value, host, request_path, now=now)
+        if parsed is None:
+            return
+        expires = parsed["expires"]
+        # expires=None 表示这条 Set-Cookie 根本没带过期时间（不是删除）
+        if expires is None or expires > now:
+            return
+        name, domain, tailmatch, path = (parsed["name"], parsed["domain"],
+                                         parsed["tailmatch"], parsed["path"])
+        with self._lock:
+            for key in [k for k in self._lines
+                        if k[0] == name and k[1] == domain and k[3] == path]:
+                self._drop_key(key)
+            # 引擎那侧也可能留着一份同作用域的行
+            self._explicit.pop(name, None)
+
     def _wanted(self, host: str, now: float) -> dict[tuple[str, str, bool, str], str]:
-        """本次请求在 ``host`` 上应该生效的全部 cookie 行（作用域键 -> 行）。"""
+        """本次请求在 ``host`` 上**作用域命中**的全部 cookie 行（作用域键 -> 行）。"""
         self._prune(now)
         with self._lock:
-            wanted = dict(self._lines)
+            wanted: dict[tuple[str, str, bool, str], str] = {}
+            for key, line in self._lines.items():
+                name, domain, tailmatch, _path = key
+                if _domain_matches(host, domain, tailmatch):
+                    wanted[key] = line
             for name, value in self._explicit.items():
                 key = (name, host, False, "/")
-                if key not in wanted:      # 引擎里已有该主机下的同名 cookie，就别造第二份
-                    wanted[key] = _netscape_cookie_line(host, False, "/", name, value)
-        return wanted
+                if key not in wanted:
+                    wanted[key] = _netscape_cookie_line(host, False, "/", str(name),
+                                                        "" if value is None else str(value))
+            return wanted
+
+    def _candidates(self, host: str, request_path: str, secure: bool,
+                    now: float) -> list[tuple[str, str]]:
+        """本次请求该发出的 cookie，**按浏览器口径排好序**。
+
+        排序规则（RFC 6265 5.4 / Chrome 实测）：path 长者在先，同长按创建时间升序。
+        """
+        self._prune(now)
+        ranked: list[tuple[int, int, str, str]] = []
+        with self._lock:
+            for key, line in self._lines.items():
+                name, domain, tailmatch, cookie_path = key
+                if not _domain_matches(host, domain, tailmatch):
+                    continue
+                if not _path_matches(request_path, cookie_path):
+                    continue
+                fields = _cookie_line_fields(line)
+                if fields is None:
+                    continue
+                _key, is_secure, expires_at, value = fields
+                if expires_at and expires_at <= now:
+                    continue
+                if is_secure and not secure:
+                    continue
+                ranked.append((-len(cookie_path or "/"), self._seq.get(key, 0), name, value))
+            for name, value in list(self._explicit.items()):
+                bound = self._explicit_host.get(name)
+                if bound is None:
+                    # 没有 Domain 的 cookie：第一次用到时绑成 host-only
+                    self._explicit_host[name] = host
+                    bound = host
+                if bound != host:
+                    continue
+                key = (name, host, False, "/")
+                if key in self._lines:
+                    continue
+                if key not in self._seq:
+                    self._seq[key] = self._next_seq()
+                ranked.append((-1, self._seq[key], name, "" if value is None else str(value)))
+        ranked.sort()
+        return [(name, value) for _l, _s, name, value in ranked]
+
+    def cookie_parts(self, host: str, request_path: str = "/", *,
+                     secure: bool = False, pairs: Iterable[tuple[str, str]] = (),
+                     raw: str = "", now: float | None = None) -> list[str]:
+        """本次请求该发的 cookie，**一条一份**（HTTP/2 拆行用）。
+
+        顺序：``raw``（用户整串给的）→ ``pairs``（请求级 ``cookies=``）
+        → 罐内命中的 cookie（浏览器排序：path 长者先、同长按创建时间）。
+        """
+        now = time.time() if now is None else float(now)
+        parts: list[str] = []
+        explicit_names: set[str] = set()
+        text = (raw or "").strip()
+        if text:
+            parts.append(text)
+            explicit_names.update(_cookie_names(text))
+        for name, value in pairs:
+            parts.append("%s=%s" % (name, value))
+            explicit_names.add(str(name))
+        for name, value in self._candidates((host or "").lower(), request_path,
+                                           secure, now):
+            # 只挡住"用户已经显式给过"的同名 cookie；罐里同名不同 path 的几条
+            # **都要发**（浏览器就是 sid=deep; sid=root 这么发的）。
+            if name in explicit_names:
+                continue
+            parts.append("%s=%s" % (name, value))
+        return parts
+
+    def header_value(self, host: str, request_path: str = "/", *,
+                     secure: bool = False, pairs: Iterable[tuple[str, str]] = (),
+                     raw: str = "", now: float | None = None) -> str:
+        """拼一条 ``Cookie:`` 头值（不带 ``Cookie:`` 前缀）。"""
+        return "; ".join(self.cookie_parts(host, request_path, secure=secure,
+                                           pairs=pairs, raw=raw, now=now))
 
     def _prune(self, now: float) -> None:
         """丢弃已经过期的行（比如从文件读进来的、带过期时间的 cookie）。"""
@@ -272,13 +613,10 @@ class CookieJar(dict):
             for key, line in list(self._lines.items()):
                 parsed = parse_cookie_line(line)
                 if parsed and parsed[2] and parsed[2] <= now:
-                    self._lines.pop(key, None)
-                    if not any(k[0] == key[0] for k in self._lines):
-                        dict.pop(self, key[0], None)
+                    self._drop_key(key)
 
     def __repr__(self) -> str:
         return "CookieJar(%r)" % (dict(self),)
-
 
 
 def parse_header_blocks(raw: bytes) -> list[tuple[int, str, Headers]]:
@@ -439,12 +777,22 @@ class Response:
 
     @property
     def cookies(self) -> Cookies:
+        """本次响应里 ``Set-Cookie`` 的视图（带 domain/path 元信息）。"""
         jar = Cookies()
         for raw in self.headers.get_list("set-cookie"):
             pair = raw.split(";", 1)[0].strip()
-            if "=" in pair:
-                name, _, value = pair.partition("=")
-                jar[name.strip()] = value.strip()
+            if "=" not in pair:
+                continue
+            name, _, value = pair.partition("=")
+            name, value = name.strip(), value.strip()
+            if not name:
+                continue
+            jar[name] = value
+            parsed = parse_set_cookie(raw, "", "/")
+            if parsed:
+                jar._meta[name] = {"domain": parsed["domain"],
+                                   "path": parsed["path"],
+                                   "secure": parsed["secure"]}
         return jar
 
     @property
@@ -457,7 +805,22 @@ class Response:
 
     # -- 方法 ------------------------------------------------------------- #
     def json(self, **kwargs: Any) -> Any:
-        return _json.loads(self.content.decode(self.encoding or "utf-8", errors="replace"), **kwargs)
+        """解析 JSON（对齐浏览器：**先按 UTF-8** 解，解不开才回退到声明的 charset）。
+
+        Chrome 的 ``Response.json()`` 永远按 UTF-8 解码（`Response.text()` 也是），
+        即使响应头写了别的 charset —— 实测 ``application/json; charset=gbk`` + GBK
+        字节在 Chrome 里就是乱码。我们跟这个口径走，只在 UTF-8 解不开时才用
+        :attr:`encoding` / 猜出来的编码兜底，避免把本来能读的数据变成替换符。
+        """
+        content = self.content
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                text = content.decode(self.encoding or "utf-8")
+            except (UnicodeDecodeError, LookupError):
+                text = content.decode(self.apparent_encoding or "utf-8", errors="replace")
+        return _json.loads(text, **kwargs)
 
     def raise_for_status(self) -> "Response":
         if 400 <= self.status_code < 600:

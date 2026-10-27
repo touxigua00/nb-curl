@@ -75,7 +75,7 @@ class _Transfer:
 
     __slots__ = (
         "prep", "tcp_profile", "retry", "future", "loop", "pool", "handle",
-        "partition", "rcvbuf_plan", "tcp_switched", "transient",
+        "partition", "rcvbuf_plan", "tcp_switched",
         "cancel_requested", "finished", "settled", "finish_waiter",
         "code", "error", "status",
         "body", "raw_headers", "info", "cookie_dump", "wall", "started",
@@ -93,7 +93,6 @@ class _Transfer:
         self.partition: Any = None
         self.rcvbuf_plan: int | None = None
         self.tcp_switched = False
-        self.transient: Any = ()
         self.cancel_requested = False
         self.finished = False          # 收尾流程只走一次
         self.settled = False           # 已经交付（future / 等待者都处理过了）
@@ -185,7 +184,7 @@ class AsyncDriver(PollCore):
                            self.loop.create_future(), self.loop)
             tr.pool = pool
             tr.handle = handle
-            tr.rcvbuf_plan, tr.tcp_switched, tr.transient = staged
+            tr.rcvbuf_plan, tr.tcp_switched = staged
             lib.easy_set_fresh_connect(
                 handle.ptr, 1 if retry.fresh_connect(tr.tcp_switched) else 0)
             if lib.prepare_request(handle.ptr) != 0:
@@ -546,8 +545,7 @@ class AsyncDriver(PollCore):
         # 4) 收尾读数 + TCP 回读校验（都在所有者线程上，句柄已不在 multi 里）
         try:
             session._verify_tcp(tr.handle, tr.code, tr.tcp_profile, tr.rcvbuf_plan)
-            tr.info, tr.cookie_dump = session._collect_result(
-                tr.handle, tr.prep, tr.transient)
+            tr.info, tr.cookie_dump = session._collect_result(tr.handle, tr.prep)
         except Exception as exc:  # noqa: BLE001
             # 收尾失败**不能**降级成"成功空正文"：句柄状态已不确定，弃掉并真实失败。
             self._discard_failed(tr, "收尾读数失败: %r" % (exc,))
@@ -585,7 +583,7 @@ class AsyncDriver(PollCore):
             return False
         try:
             staged = self._session._configure(tr.handle, tr.prep, tr.tcp_profile)
-            tr.rcvbuf_plan, tr.tcp_switched, tr.transient = staged
+            tr.rcvbuf_plan, tr.tcp_switched = staged
             lib.easy_set_fresh_connect(tr.handle.ptr, 1)
             if lib.prepare_request(tr.handle.ptr) != 0:
                 raise NbCurlError("native 准备请求失败（重试）")
@@ -766,7 +764,7 @@ def async_result_to_response(session: Any, tr: _Transfer) -> Any:
     Cookie 吸收与错误码映射走 :meth:`Session._finish` —— 与同步路径**同一份**语义；
     ``_build_response`` 也是同步路径用的那个函数（含 history / 1xx 过滤）。
     """
-    session._finish(tr.prep, tr.info, tr.cookie_dump, tr.transient,
-                    tr.code, tr.error)
-    return _build_response(tr.prep, tr.info, tr.status, tr.body, tr.raw_headers,
-                           tr.wall, tr.cookie_dump)
+    response = _build_response(tr.prep, tr.info, tr.status, tr.body, tr.raw_headers,
+                               tr.wall, tr.cookie_dump)
+    session._finish(tr.prep, tr.info, tr.cookie_dump, tr.code, tr.error, response)
+    return response

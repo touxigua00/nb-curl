@@ -9,10 +9,13 @@
   丢 header"这类问题。
 * **impersonate 先于用户头下发**：libcurl 内部把浏览器默认头放在
   CURLOPT_HTTPBASEHEADER，用户头放 CURLOPT_HTTPHEADER，两者按序合并。
-* **cookie 只有一条通道**：内建 cookie 引擎负责把 cookie 拼进 ``Cookie:`` 头，
-  Python 侧只管把"该有哪些 cookie"同步进引擎（``CURLOPT_COOKIELIST``）。两条路
-  并存会让同一个 cookie 被拼两遍（``Cookie: sid=x; sid=x``），所以本模块**绝不**
-  设置 ``CURLOPT_COOKIE``。
+* **cookie 每次请求只走一条通道**：没有显式 cookie 时由内建引擎拼 ``Cookie:``
+  （Python 侧只把"该有哪些"同步进引擎，``CURLOPT_COOKIELIST``）；用户显式给了
+  ``Cookie`` 头或 ``cookies=`` 时，那条 cookie 变成 ``headers`` 里的一条普通
+  ``Cookie: …`` 行，引擎本次清空静默。两条路并存会让同一个 cookie 被拼两遍
+  （``Cookie: sid=x; sid=x``）。
+* **``Cookie`` 头只发一条、值原样、位置跟着 ``headers=`` 走**：显式串一个字节都不改写，
+  也不拆行（``CURLOPT_SPLIT_COOKIES`` 默认 0，见 :meth:`Session._apply_handle_options`）。
 * **stream=True 是真流式**：流由**会话级专职 reactor**（每 Session 至多一个线程，
   见 :mod:`nb_curl._stream_reactor`）驱动，写回调把每一块当场交给 Python，不经过
   C 层缓冲；缓冲超过高水位就回 ``CURL_WRITEFUNC_PAUSE``（这一块**不入队**），
@@ -35,7 +38,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Iterator, Mapping, Sequence
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 from ._facade import (
     SessionShortcuts,
@@ -72,16 +75,16 @@ from .exceptions import (
     TooManyRedirects,
     curl_error_detail,
 )
-from .fingerprint import Fingerprint, FingerprintOverrides, build_overrides
+from .fingerprint import (Fingerprint, FingerprintOverrides, build_overrides,
+                          _normalize_header_order)
 from .impersonate import is_available, resolve_target
 from .models import (
     CookieJar,
     Headers,
     Request,
     Response,
-    _netscape_cookie_line,
     expired_cookie_line,
-    parse_cookie_line,
+    is_secure_origin,
     parse_header_blocks,
 )
 from .options import CurlOpt, apply_curl_options
@@ -265,6 +268,20 @@ def _origin_of(url: str) -> tuple:
     return scheme, host, port
 
 
+def _env_ca_path() -> str | None:
+    """``REQUESTS_CA_BUNDLE`` / ``CURL_CA_BUNDLE`` 环境变量（对齐 requests / curl_cffi）。
+
+    企业内网与抓包环境（mitmproxy / Burp）基本都靠这两个变量换 CA；以前我们不读，
+    用户以为自己配好了、结果我们静默用内置 cacert 校验。路径是否存在不在这里判断
+    （指向不存在的文件应当**报错**，而不是悄悄回退 —— 与 curl 一致）。
+    """
+    for name in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
 def _default_ca_path() -> str | None:
     """找一个可用的 CA bundle：环境变量 > certifi > 包内自带。"""
     env = os.environ.get(_DEFAULT_CA_ENV)
@@ -299,22 +316,152 @@ def _merge_url(url: str, params: Any) -> str:
     return urlunsplit(parts._replace(query=urlencode(query, doseq=True)))
 
 
-def _merge_headers(base: Sequence[tuple[str, str]], extra: Any) -> list[tuple[str, str]]:
-    """extra 覆盖 base 中的同名头（保持 base 的位置），新头追加在尾部。
+#: URL 里不需要再转义的字符（保留已有的 ``%XX``）
+_URL_SAFE = "/%:@!$&'()*+,;=-._~"
+_URL_SAFE_QUERY = _URL_SAFE + "?="
 
-    extra 可以是 Mapping 或 (name, value) 序列。
+
+def _requote(uri: str) -> str:
+    """把 URL 里的非法字符（空格、中文…）转义掉，已有的 ``%XX`` 保持不动。
+
+    ``quote=True`` 时使用；等价于 requests 的 ``requote_uri`` 的实用子集。
+    """
+    parts = urlsplit(uri)
+    return urlunsplit(parts._replace(
+        path=quote(parts.path or "/", safe=_URL_SAFE),
+        query=quote(parts.query, safe=_URL_SAFE_QUERY),
+    ))
+
+
+#: 需要跟随的 3xx
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
+#: libcurl 自己跟就完全正确的"原生方法"（语义由 httpreq 决定）
+_NATIVE_METHODS = ("GET", "POST", "HEAD")
+
+
+def next_redirect_hop(prep: "_Prep", options: Mapping[str, Any],
+                      response: "Response") -> tuple[str | None, str | None, dict]:
+    """下一个请求该用什么方法 / URL / 参数（照 Chrome 155 实测矩阵）。
+
+    实测结果（``oracle/chrome_redirect_matrix.json``）：
+
+    ========  =======  =======  =======  =======  =======
+    方法      301      302      303      307      308
+    ========  =======  =======  =======  =======  =======
+    POST      GET      GET      GET      POST     POST
+    PUT       PUT      PUT      **GET**  PUT      PUT
+    PATCH     PATCH    PATCH    **GET**  PATCH    PATCH
+    DELETE    DELETE   DELETE   **GET**  DELETE   DELETE
+    HEAD      HEAD     HEAD     HEAD     HEAD     HEAD
+    ========  =======  =======  =======  =======  =======
+
+    返回 ``(None, None, {})`` 表示这一跳不是重定向、到此为止。
+    """
+    if response.status_code not in _REDIRECT_CODES:
+        return None, None, {}
+    location = response.headers.get("location")
+    if not location:
+        return None, None, {}
+    url = urljoin(prep.url, location)
+    method = prep.method
+    code = response.status_code
+    if code == 303 and method != "HEAD":
+        method = "GET"                       # 303：除 HEAD 全部降级为 GET
+    elif code in (301, 302) and method == "POST":
+        method = "GET"                       # 301/302：只降级 POST
+    # 307/308：方法与 body 都保留
+
+    next_options = dict(options)
+    if method == "GET" and prep.method != "GET":
+        # 降级成 GET：body 与外带的 Content-Type 一起丢掉（浏览器就是这样）
+        for key in ("data", "json", "files"):
+            next_options.pop(key, None)
+    return method, url, next_options
+
+
+def _final_url(url: str, params: Any) -> str:
+    """``params`` 合并 + **永远 requote**（Chrome 的 URL 解析就是这么干的）。
+
+    实测 Chrome 155：``fetch('/x?q=a b')`` 线上是 ``/x?q=a%20b``；非法字符它自己转义，
+    已有的 ``%XX`` 保持不动。我们以前对这种 URL 直接报 ``curl 3 CURLE_URL_MALFORMAT``，
+    与浏览器不一致，所以这里不再提供开关。
+    """
+    return _requote(_merge_url(url, params))
+
+
+def _expand_pairs(extra: Any) -> list[tuple[str, Any]]:
+    """把 ``headers=`` 展开成 ``[(name, value), …]``，**同名合并成一条**。
+
+    这是浏览器的真实行为（实测 Chrome 155）：
+
+    * ``fetch(url, {headers: [["X-Dup","1"],["X-Dup","2"]]})`` → 线上 ``X-Dup: 1, 2``；
+    * XHR 连续两次 ``setRequestHeader('X','1'/'2')`` → 也是 ``1, 2``（规范就是 ", " 追加）。
+
+    浏览器**根本发不出两行同名请求头**，所以这里跟它一致：同名值按出现顺序用 ", " 拼成
+    一条（数据不丢，但报文形态与浏览器相同）。list/tuple 值等价于多个同名的值。
+    值 ``None`` = 删掉该默认头；值 ``""`` = 发一条空值头。
+    """
+    merged: list[tuple[str, Any]] = []
+    index: dict[str, int] = {}
+    items: list[tuple[str, Any]] = []
+    if extra is None:
+        return merged
+    if hasattr(extra, "items"):
+        for name, value in extra.items():
+            if isinstance(value, (list, tuple)):
+                for part in value:
+                    items.append((str(name), part))
+            else:
+                items.append((str(name), value))
+    else:
+        for item in extra:
+            name, value = str(item[0]), item[1]
+            if isinstance(value, (list, tuple)):
+                for part in value:
+                    items.append((name, part))
+            else:
+                items.append((name, value))
+
+    for name, value in items:
+        key = name.lower()
+        if value is None:
+            merged.append((name, None))          # 删除语义原样保留（交给下游处理）
+            continue
+        text = value if isinstance(value, str) else str(value)
+        slot = index.get(key)
+        if slot is None:
+            index[key] = len(merged)
+            merged.append((name, text))
+        else:
+            prev_name, prev_value = merged[slot]
+            if prev_value is None:                # 前面有"删除这条"，本身就不发
+                merged[slot] = (name, text)
+            else:
+                merged[slot] = (prev_name, "%s, %s" % (prev_value, text))
+    return merged
+
+
+def _merge_headers(base: Sequence[tuple[str, Any]], extra: Any) -> list[tuple[str, Any]]:
+    """把 ``extra`` 并进 ``base``：同名头**就地覆盖**，其余按给的顺序追加。
+
+    同名多行（``headers=[("X-Dup", "1"), ("X-Dup", "2")]``）必须两条都发出去：
+    浏览器侧虽然发不了重复头，但手写客户端会（``Accept``、``X-Forwarded-For``、
+    ``Cookie`` 拆行等），历史上这里做过"同名覆盖"导致第二条被吞、报文静默失真。
+    规则：第一条同名的在**原位替换**（保证默认头的相对顺序不乱），后续同名的
+    追加在后面。
     """
     result = list(base)
-    index: dict[str, int] = {}
-    for i, (name, _) in enumerate(result):
-        index.setdefault(name.lower(), i)
-    pairs = list(extra.items()) if hasattr(extra, "items") else list(extra)
-    for name, value in pairs:
+    taken: set[int] = set()
+    first_pos: dict[str, int] = {}
+    for i, (name, _value) in enumerate(result):
+        first_pos.setdefault(str(name).lower(), i)
+    for name, value in _expand_pairs(extra):
         key = name.lower()
-        if key in index:
-            result[index[key]] = (name, value)
+        slot = first_pos.get(key)
+        if slot is not None and slot not in taken:
+            taken.add(slot)
+            result[slot] = (name, value)
         else:
-            index[key] = len(result)
             result.append((name, value))
     return result
 
@@ -371,7 +518,24 @@ def _encode_multipart(fields: Mapping[str, Any], files: Mapping[str, Any],
 
 
 def _build_body(options: Mapping[str, Any]) -> tuple[bytes | None, list[tuple[str, str]]]:
-    """按 files > json > data 的优先级拼请求体，返回 (body, 需要补的 Content-Type)。"""
+    """按 files > json > data 的优先级拼请求体，返回 (body, 需要补的 Content-Type)。
+
+    Content-Type 的推断**照抄 Chrome**（实测 Chrome 155）：
+
+    ==============================  ==================================================
+    ``fetch(url, {body: …})``       浏览器发的 Content-Type
+    ==============================  ==================================================
+    字符串（``'abc'``）              ``text/plain;charset=UTF-8``
+    ``Uint8Array`` / ``ArrayBuffer`` **不发** Content-Type
+    ``URLSearchParams``              ``application/x-www-form-urlencoded;charset=UTF-8``
+    ``FormData``                     ``multipart/form-data; boundary=----WebKitFormBoundary…``
+    ``Blob``（带 type）              用 Blob 自己的 type
+    ==============================  ==================================================
+
+    以前这里对 str/bytes 一律不设，于是 libcurl 自己补了
+    ``application/x-www-form-urlencoded``（它设 ``POSTFIELDS`` 时的默认值）——
+    声明成表单却没做表单编码，服务端按表单解析必然出错。
+    """
     files = options.get("files")
     data = options.get("data")
     if files:
@@ -382,11 +546,29 @@ def _build_body(options: Mapping[str, Any]) -> tuple[bytes | None, list[tuple[st
         return (_json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 [("Content-Type", "application/json")])
     if data is None:
-        return None, []
+        # 没有 body：把 libcurl 给 POST 补的默认 Content-Type（form-urlencoded）也去掉，
+        # 浏览器在"没有 body"时就是不发 Content-Type。
+        return None, [("Content-Type", None)]
     if isinstance(data, Mapping):
+        # 表单提交的口径：Chrome 155 提交 form 时是
+        # ``Content-Type: application/x-www-form-urlencoded``（**不带** charset；
+        # fetch 里用 URLSearchParams 才会带 ``;charset=UTF-8``）。
         return (urlencode(data, doseq=True).encode("utf-8"),
                 [("Content-Type", "application/x-www-form-urlencoded")])
-    return _to_bytes(data), []
+    if isinstance(data, (list, tuple)) and data and isinstance(data[0], (list, tuple)):
+        # [(k, v), …] 形式（同样按表单提交口径）
+        return (urlencode(data, doseq=True).encode("utf-8"),
+                [("Content-Type", "application/x-www-form-urlencoded")])
+    if isinstance(data, str):
+        return data.encode("utf-8"), [("Content-Type", "text/plain;charset=UTF-8")]
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        # Chrome 对二进制 body 不发 Content-Type；libcurl 会自己补 form 编码，得显式删掉
+        return bytes(data), [("Content-Type", None)]
+    if hasattr(data, "read"):           # 文件对象：读出来，不猜类型
+        return _to_bytes(data.read()), [("Content-Type", None)]
+    if hasattr(data, "__iter__"):       # 生成器/可迭代：拼起来
+        return b"".join(_to_bytes(chunk) for chunk in data), [("Content-Type", None)]
+    return _to_bytes(data), [("Content-Type", None)]
 
 
 def _pick_proxy(proxy: Any, proxies: Any, scheme: str) -> str | None:
@@ -408,10 +590,11 @@ def _pick_proxy(proxy: Any, proxies: Any, scheme: str) -> str | None:
 
 
 def _parse_cookie_pairs(value: str) -> list[tuple[str, str]]:
-    """把用户显式给的 ``Cookie:`` 头值拆成 ``[(name, value), …]``。
+    """把一条 ``Cookie:`` 头值拆成 ``[(name, value), …]``（**只用于认名字**）。
 
     值原样保留（只有名字与分隔用的空白会被去掉），因为有些站点的签名 cookie
-    里带 ``=`` 之类的字符。
+    里带 ``=`` 之类的字符。发送路径已经改成"整串原样下发"，所以这个函数现在
+    只服务于"哪些名字已经出现过"的判断。
     """
     pairs: list[tuple[str, str]] = []
     for item in value.split(";"):
@@ -425,17 +608,38 @@ def _parse_cookie_pairs(value: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def _header_lines_arg(pairs: Sequence[tuple[str, str]]) -> list[bytes]:
-    """把 (name, value) 序列编码成 C 侧的 header 行数组（保序、保重复）。"""
+def _header_lines_arg(pairs: Sequence[tuple[str, Any]]) -> list[bytes]:
+    """把 (name, value) 序列编码成 C 侧的 header 行数组（保序、保重复）。
+
+    * ``value is None`` → ``"Name:"``：让 libcurl 删掉同名默认头；
+    * ``value == ""`` → ``"Name: "``：**发一条空值头**（Chrome 就是这么发的）；
+    * 其余按 **latin-1** 编码 —— HTTP 头的字节语义就是 latin-1（WHATWG 的
+      ByteString），编不进去的值（中文等）直接报错，而不是静默按 UTF-8 发出去
+      （那会产出浏览器永远发不出来的头字节序）。
+    """
     lines: list[bytes] = []
     for name, value in pairs:
         if value is None:
-            lines.append(("%s:" % name).encode("utf-8"))  # value=None = 移除该默认头
+            # libcurl 的语义：`Name:`（无值）= 删掉同名默认头
+            lines.append(("%s:" % name).encode("latin-1", "strict"))
             continue
-        text = str(value)
+        text = value if isinstance(value, str) else str(value)
         if "\r" in text or "\n" in text:
             raise NbCurlError("头部值不能包含换行: %r" % name)
-        lines.append(("%s: %s" % (name, text)).encode("utf-8"))
+        if text == "":
+            # 空值头要用 `Name;` 这种写法才发得出去（`Name: ` 会被 libcurl 当成删除）
+            lines.append(("%s;" % name).encode("latin-1"))
+            continue
+        try:
+            raw = ("%s: %s" % (name, text)).encode("latin-1")
+        except UnicodeEncodeError as exc:
+            # 浏览器就是这个行为（实测 Chrome 155）：
+            #   fetch → TypeError: String contains non ISO-8859-1 code point.
+            #   XHR .setRequestHeader → 同一条 TypeError。
+            raise TypeError(
+                "请求头 %r 的值含非 ISO-8859-1 字符（浏览器同样拒绝）：%r"
+                % (name, text)) from exc
+        lines.append(raw)
     return lines
 
 
@@ -634,16 +838,28 @@ class _Prep:
     ech: Any
     doh: str | None
     dns_cache_ttl: int | None
+    http3_permute_extensions: bool | None
+    """HTTP/3 的 QUIC ClientHello 是否逐连接随机打乱 TLS 扩展顺序。
+
+    ``None`` = 不下发（跟随 C 内核/preset 的默认），``True`` / ``False`` = 显式开关。"""
     interface: str | None
     pinned_key: str | None
     max_download_speed: int | None
     max_upload_speed: int | None
     curl_options: Any
     headers: list[tuple[str, str]]
-    cookie_pairs: list[tuple[str, str]]
+    cookie_header: str | None
+    """本次请求最终发出去的 ``Cookie`` 头值（显式 cookie + 会话罐，已按浏览器口径排序）。
+
+    发送走 ``headers`` 里的那条 ``Cookie`` 行；内建引擎在发送前被清空
+    （见 :meth:`Session._sync_cookies`），只负责学习响应里的 ``Set-Cookie``。
+    """
     host: str
     stream: bool
     body: bytes | None
+    discard_cookies: bool = False
+    follow_python: bool = False
+    """这个请求的重定向是否由 Python 侧跟（见 :meth:`Session._follow_redirects`）。"""
 
 
 @dataclass(frozen=True)
@@ -814,7 +1030,6 @@ class _StreamBody:
         self._blocks: list[tuple[int, str, Headers]] = []
         self._raw_headers = bytearray()
         self._code_dump = ""
-        self._transient: list[tuple] = []
         # 已经取出来、还没交出去的字节。放在实例上而不是生成器局部变量：
         # 调用方中途 break 之后，这些字节必须留给下一次 iter_content / content。
         self._pending = bytearray()
@@ -1179,6 +1394,12 @@ class Session(SessionShortcuts):
         self.diy_fp = dict(diy_fp) if diy_fp else None
         self.default_headers = _session_default(options, "default_headers")
         self.h2_priority = options.get("h2_priority")
+        # 请求头顺序：与 impersonate 同级的显式参数（None = 跟随预设）。
+        header_order = options.get("header_order")
+        self.header_order = header_order
+        # HTTP/3 的 QUIC ClientHello 扩展顺序随机化（None = 跟随预设：
+        # Chrome / Edge 系预设默认开，其余关）。
+        self.http3_permute_extensions = options.get("http3_permute_extensions")
 
         # fp_file：浏览器指纹快照（xcctls.top/all 的响应）。
         # 会话级只解析一次（load_fp_snapshot 自带按 mtime+size 的缓存）；
@@ -1199,11 +1420,19 @@ class Session(SessionShortcuts):
         self.verify = _session_default(options, "verify")
         ca_path = options.get("ca_path")
         self.ca_path = ca_path if ca_path is not None else (
-            _default_ca_path() if self.verify else None)
+            (_env_ca_path() or _default_ca_path()) if self.verify else None)
         self.timeout = options.get("timeout")
         self.connect_timeout = options.get("connect_timeout")
         self.allow_redirects = _session_default(options, "allow_redirects")
         self.max_redirects = _session_default(options, "max_redirects")
+        # credentials：对齐 fetch 的 credentials 语义（浏览器口径）。
+        #   None / "include" / "same-origin" → 正常发 cookie 并记住响应 Set-Cookie
+        #   "omit"                          → 本次请求既不发也不记（浏览器就是这么做的）
+        credentials = options.get("credentials")
+        if credentials is not None and credentials not in ("omit", "same-origin", "include"):
+            raise ValueError(
+                "credentials 只能是 'omit' / 'same-origin' / 'include'，收到 %r" % (credentials,))
+        self.credentials = credentials
         http_version = options.get("http_version")
         if http_version is not None:
             resolve_http_version(http_version)  # 提前校验，别等到发请求才报错
@@ -1399,11 +1628,12 @@ class Session(SessionShortcuts):
     # ------------------------------------------------------------------ #
     # 内部：指纹与连接池
     # ------------------------------------------------------------------ #
-    def _build_fingerprint(self, options: Mapping[str, Any], h2_priority: Any) -> Fingerprint:
+    def _build_fingerprint(self, options: Mapping[str, Any], h2_priority: Any,
+                           header_order: Any = None) -> Fingerprint:
         """合并所有指纹来源，优先级（低 -> 高）：
 
         impersonate 底座 < 会话级 ja3/akamai/diy_fp < 请求级快照
-        < 请求级 ja3/akamai/diy_fp < 显式 ``h2_priority``。
+        < 请求级 ja3/akamai/diy_fp < 显式 ``h2_priority`` / ``header_order``。
 
         - ``impersonate`` 传 :class:`Fingerprint` 对象（如 ``parse_xcctls()``
           的结果）-> 当作请求级快照参与合并；
@@ -1458,6 +1688,12 @@ class Session(SessionShortcuts):
         if h2_priority is not None:
             overrides = overrides.merge(
                 FingerprintOverrides(http2_headers_priority=bool(h2_priority)))
+        # 请求头顺序是显式参数（与 impersonate 同级），压过预设与 diy_fp。
+        # 这里统一归一化成 C 层要的逗号串（字符串 / 列表两种写法都收），
+        # 顺带保证 cache_key / 池键可哈希。
+        if header_order is not None:
+            overrides = overrides.merge(FingerprintOverrides(
+                header_order=_normalize_header_order(header_order)))
         fp.overrides = overrides
         return fp
 
@@ -1489,7 +1725,9 @@ class Session(SessionShortcuts):
     # ------------------------------------------------------------------ #
     def _prepare(self, method: str, url: str, options: Mapping[str, Any]) -> _Prep:
         """算出一个请求的全部生效值（请求级 > 会话级），并定位连接池分区。"""
-        fp = self._build_fingerprint(options, _pick(options, "h2_priority", self.h2_priority))
+        fp = self._build_fingerprint(
+            options, _pick(options, "h2_priority", self.h2_priority),
+            _pick(options, "header_order", self.header_order))
 
         verify = bool(_pick(options, "verify", self.verify))
         ca_path = _pick(options, "ca_path", self.ca_path)
@@ -1511,26 +1749,72 @@ class Session(SessionShortcuts):
                 fp.overrides = fp.overrides.merge(
                     FingerprintOverrides(header_order=_CONNECTION_ORDER))
 
+        # 浏览器行为（实测 Chrome 155）：GET/HEAD 带 body 直接抛 TypeError
+        #   "Request with GET/HEAD method cannot have body."
+        method_upper = method.upper()
+        if method_upper in ("GET", "HEAD") and (
+                options.get("data") is not None or options.get("json") is not None
+                or options.get("files") is not None):
+            raise TypeError("Request with GET/HEAD method cannot have body.")
+
         body, extra_headers = _build_body(options)
         if extra_headers:
-            merged = _merge_headers(merged, dict(extra_headers))
+            # 用户显式写了 Content-Type 就不覆盖（Chrome 也是"你给的优先"）
+            has_ct = any(str(n).lower() == "content-type" for n, _v in merged)
+            for name, value in extra_headers:
+                if has_ct and str(name).lower() == "content-type":
+                    continue
+                merged = _merge_headers(merged, [(name, value)])
 
-        # 本次请求专用的 cookie（用完即从引擎里撤掉，不进会话罐）：
-        #   1) 用户自己塞的 Cookie 头 —— 拆成 cookie 交给引擎，请求头里就不再出现它。
-        #      留着它的话，引擎还会再拼一条，线上就是两个 Cookie 头（真实浏览器只有一个）；
-        #   2) cookies= 参数 —— 语义是"叠加在 session.cookies 之上"，只对本次请求生效。
+        # 本次请求的 cookie：整条 ``Cookie:`` 头**一律由 Python 拼**（浏览器口径）。
+        #   1) 用户自己塞的 Cookie 头 —— 值逐字节原样，位置就是 headers= 里那个位置；
+        #   2) cookies= 参数 —— 语义是"叠加在 session.cookies 之上"，只对本次请求生效；
+        #   3) 会话罐里命中的 cookie —— 按 RFC 6265 5.4 排序（path 长者先、同长按创建
+        #      时间），Secure 只走安全上下文，host-only 的不会串到别的主机。
+        # 为什么不让内建引擎拼：它按 path/domain/name **长度**排序（lib/cookie.c 的
+        # cookie_sort），顺序与浏览器不同；而且它不管"显式 Cookie 头"这一路，两条
+        # 并存会把同一个 cookie 拼两遍。
+        cookie_raw_parts: list[str] = []
+        cookie_slot: int | None = None
+        kept: list[tuple[str, Any]] = []
+        for name, value in merged:
+            if str(name).lower() == "cookie":
+                if cookie_slot is None:
+                    cookie_slot = len(kept)          # 记住用户放的位置
+                text = "" if value is None else str(value).strip()
+                if text:                             # 空值、纯空白 = 没有 cookie
+                    cookie_raw_parts.append(text)
+            else:
+                kept.append((name, value))
+        merged = kept
         cookie_pairs: list[tuple[str, str]] = []
-        if any(name.lower() == "cookie" for name, _ in merged):
-            kept = []
-            for name, value in merged:
-                if name.lower() == "cookie":
-                    cookie_pairs.extend(_parse_cookie_pairs(str(value)))
-                else:
-                    kept.append((name, value))
-            merged = kept
         for name, value in (options.get("cookies") or {}).items():
             if value is not None:
                 cookie_pairs.append((str(name), str(value)))
+
+        scheme, host, _port = _origin_of(url)
+        credentials = _pick(options, "credentials", self.credentials)
+        discard_cookies = credentials == "omit"
+        cookie_header: str | None = None
+        if cookie_raw_parts or cookie_pairs or not discard_cookies:
+            cookie_header = self.cookies.header_value(
+                host,
+                urlsplit(url).path or "/",
+                secure=is_secure_origin(scheme, host),
+                pairs=cookie_pairs,
+                raw="; ".join(cookie_raw_parts),
+                now=time.time(),
+            ) or None
+        if cookie_header:
+            # 用户给了 Cookie 头 -> 回到原位；只从罐里拼的 -> 追加到末尾
+            # （Chrome 的 Cookie 头就在最后一条，实测 http://127.0.0.1 抓包确认）。
+            #
+            # 注意：**永远只发一条**。实测 Chrome 155 在 HTTP/2 上也是把全部 cookie
+            # 拼成一条 `cookie` 头（本地 h2 服务端抓到的就是
+            # `['a=1; bb=2; zebra=3']`，不是多条）；旧版本 Chrome 曾经拆行，
+            # 现在不拆了，所以 ``diy_fp={"split_cookies": ...}`` 对这条头不再有任何作用。
+            spot = len(merged) if cookie_slot is None else min(cookie_slot, len(merged))
+            merged.insert(spot, ("Cookie", cookie_header))
 
         credentials = _pick(options, "auth", self.auth)
         if not credentials:
@@ -1549,6 +1833,14 @@ class Session(SessionShortcuts):
         max_download_speed = _pick(options, "max_download_speed", self.max_download_speed)
         max_upload_speed = _pick(options, "max_upload_speed", self.max_upload_speed)
         curl_options = _pick(options, "curl_options", self.curl_options)
+        # H3 的 QUIC ClientHello 扩展顺序随机化：Chrome 每次连接都不一样，
+        # 固定顺序本身是指纹。None = 跟随预设口径（Chrome/Edge 系默认开）。
+        h3_permute = _pick(options, "http3_permute_extensions",
+                           self.http3_permute_extensions)
+        if h3_permute is None:
+            _target = (fp.impersonate or "").partition(":")[0].strip().lower()
+            if _target.startswith(("chrome", "edge")):
+                h3_permute = True
 
         # 连接池键：指纹 + 连接身份 + 上面这些会影响句柄状态的 option
         key = (
@@ -1569,10 +1861,11 @@ class Session(SessionShortcuts):
             pinned_key or "",
             int(max_download_speed) if max_download_speed is not None else -1,
             int(max_upload_speed) if max_upload_speed is not None else -1,
+            -1 if h3_permute is None else (1 if h3_permute else 0),
             _curl_opts_key(curl_options),
         )
 
-        return _Prep(
+        prep = _Prep(
             method=method.upper(),
             url=url,
             key=key,
@@ -1591,17 +1884,36 @@ class Session(SessionShortcuts):
             ech=ech,
             doh=doh,
             dns_cache_ttl=dns_cache_ttl,
+            http3_permute_extensions=h3_permute,
             interface=interface,
             pinned_key=pinned_key,
             max_download_speed=max_download_speed,
             max_upload_speed=max_upload_speed,
             curl_options=curl_options,
             headers=merged,
-            cookie_pairs=cookie_pairs,
-            host=_origin_of(url)[1],
+            cookie_header=cookie_header,
+            host=host,
             stream=bool(_pick(options, "stream", self.stream)),
             body=body,
+            discard_cookies=discard_cookies,
+            follow_python=(bool(_pick(options, "allow_redirects", self.allow_redirects))
+                           and method.upper() not in _NATIVE_METHODS),
         )
+        return self._with_redirect_plan(prep)
+
+    @staticmethod
+    def _with_redirect_plan(prep: "_Prep") -> "_Prep":
+        """把「谁来跟重定向」这件事定下来。
+
+        * GET/POST/HEAD —— 交给 libcurl（它的 httpreq 语义与浏览器完全一致）；
+        * 其余方法（PUT/PATCH/DELETE/OPTIONS/TRACE）—— libcurl 只会把语义切 GET、
+          方法串留着（303 该降级的情况它降不下来），所以在 Python 侧按
+          :func:`next_redirect_hop` 的矩阵自己跟。
+        """
+        if prep.follow_python:
+            prep.redirects = False
+            prep.stream = False        # 中间跳要整读，索性整条请求都缓冲
+        return prep
 
     def _apply_fingerprint(self, ptr: Any, fp: Fingerprint) -> None:
         if fp.impersonate:
@@ -1638,6 +1950,10 @@ class Session(SessionShortcuts):
             lib.set_option_string(ptr, CurlOpt.DOH_URL, _as_bytes(prep.doh))
         if prep.dns_cache_ttl is not None:
             lib.set_option_long(ptr, CurlOpt.DNS_CACHE_TIMEOUT, int(prep.dns_cache_ttl))
+        if prep.http3_permute_extensions is not None:
+            # CURL_HTTP3_SSL_PERMUTE_ENABLE=1 / DISABLE=0（-1 = 回退默认）
+            lib.set_option_long(ptr, CurlOpt.HTTP3_SSL_PERMUTE_EXTENSIONS,
+                                1 if prep.http3_permute_extensions else 0)
         if prep.interface:
             lib.set_option_string(ptr, CurlOpt.INTERFACE, _as_bytes(prep.interface))
         if prep.pinned_key:
@@ -1686,8 +2002,18 @@ class Session(SessionShortcuts):
             ptr, prep.userpwd.encode("utf-8") if prep.userpwd else None)
 
         lib.easy_set_header_lines(ptr, _header_lines_arg(prep.headers))
-        # 这一行是**故意**不写 CURLOPT_COOKIE 的：cookie 只有内建引擎一条通道
-        # （见 _sync_cookies）。两条路并存就会把同一个 cookie 拼两遍。
+        # Cookie 头已经在上面那份 header 行里（显式 cookie 由 Python 拼成一条
+        # ``Cookie: …`` 行、位置就是用户给的那个位置），所以 CURLOPT_COOKIE 这一路
+        # 必须保持 NULL —— 句柄是池里复用的，上一次请求留下的值不清掉就会多一条。
+        lib.easy_set_cookies(ptr, None)
+        # 引擎自己拼的 Cookie 也只发**一条**头。curl-impersonate 的每个预设都把
+        # split_cookies 打开，HTTP/2 下 libcurl 会把 "a=1; b=2" 拆成两条 `cookie`
+        # 头（lib/http.c 的 http_cookies split 分支）。服务端只要按"同名头覆盖"
+        # 或只读最后一条处理，整串登录态就只剩一截。这里显式按不拆行下发；
+        # 想复刻浏览器式拆行，用 diy_fp={"split_cookies": True} 打开。
+        lib.set_option_long(
+            ptr, CurlOpt.SPLIT_COOKIES,
+            1 if prep.fingerprint.overrides.split_cookies else 0)
         lib.easy_set_url(ptr, prep.url.encode("utf-8"))
         if not handshake:
             lib.easy_set_method(ptr, prep.method.encode("utf-8"))
@@ -1742,43 +2068,22 @@ class Session(SessionShortcuts):
         return rcvbuf_plan, switched
 
     # ------------------------------------------------------------------ #
-    # cookie：只有内建引擎一条通道
+    # cookie：引擎拼头 与 显式 Cookie 头行，同一时刻只用一条
     # ------------------------------------------------------------------ #
     def _sync_cookies(self, ptr: Any, prep: _Prep,
-                      pushed: dict[tuple, str]) -> list[tuple[str, str, bool, str]]:
-        """把会话罐里的 cookie 同步进这只 handle 的引擎，返回本次专用 cookie 的作用域键。
+                      pushed: dict[tuple, str]) -> None:
+        """发送前把这只 handle 的 cookie 引擎**清空**（`ALL`）。
 
-        内建引擎（libcurl 的 cookie engine）负责把 cookie 拼进 ``Cookie:`` 请求头，
-        也是唯一通道：引擎自己从 ``Set-Cookie`` 学到的、和用户显式给的，都在同一个罐里，
-        所以不会出现同名 cookie 被拼两遍。
+        为什么清空：``Cookie:`` 头一律由 Python 侧按浏览器口径拼好放进 header 行
+        （见 :meth:`_prepare`），引擎再拼一条就会变成两个 ``Cookie`` 头、或者顺序
+        被它自己的 ``cookie_sort`` 改写。引擎仍然开着，所以**本次响应**里的
+        ``Set-Cookie`` 照常被学到，收尾时经 ``CURLINFO_COOKIELIST`` 导出并吸收进
+        会话罐（罐里原有的 cookie 一条都没丢，它们本来就在 Python 侧）。
 
-        * 只推**引擎里还缺的**（``pushed`` 记录已下发状态），因此每次请求只花几次 setopt；
-        * 会话罐里已经没有的（用户删了 / 过期了）推一条过期行，等价于从引擎里删掉；
-        * 本次专用 cookie（显式 ``Cookie`` 头、请求级 ``cookies=``）按本次请求的主机
-          补作用域，并在用完之后撤掉 —— 它们不进会话罐。见 :meth:`_drop_transient_cookies`。
+        ``pushed`` 因此不再需要增量下发（留参数是为了兼容既有调用点）。
         """
-        wanted = self.cookies._wanted(prep.host, time.time())
-        transient: list[tuple[str, str, bool, str]] = []
-        for name, value in prep.cookie_pairs:
-            key = (name, prep.host, False, "/")
-            transient.append(key)
-            wanted[key] = _netscape_cookie_line(prep.host, False, "/", name, value)
-            pushed.pop(key, None)  # 可能与会话罐里的同名项冲突，强制按本次的值重推
-        for key, line in wanted.items():
-            if pushed.get(key) != line:
-                lib.easy_set_cookie_list(ptr, line.encode("utf-8"))
-                pushed[key] = line
-        for key in [k for k in pushed if k not in wanted]:
-            lib.easy_set_cookie_list(ptr, expired_cookie_line(key).encode("utf-8"))
-            del pushed[key]
-        return transient
-
-    def _drop_transient_cookies(self, ptr: Any, keys: Sequence[tuple],
-                               pushed: dict[tuple, str]) -> None:
-        """本次专用 cookie 用完即弃：从引擎里删掉，并让会话罐里的同名项下次重推。"""
-        for key in keys:
-            lib.easy_set_cookie_list(ptr, expired_cookie_line(key).encode("utf-8"))
-            pushed.pop(key, None)
+        lib.easy_set_cookie_list(ptr, b"ALL")
+        pushed.clear()
 
     def _warn_stream_tcp(self, profile: TcpProfile) -> None:
         """``stream=True`` 与 ``tcp=`` 同用时的提醒（每次会话只说一次）。
@@ -1845,7 +2150,8 @@ class Session(SessionShortcuts):
         文案统一带数值、符号名、中文说明与官方错误码手册链接，
         方便直接按错误码查。代理相关的失败再补上"代理子原因"（``proxy_error``）
         与"这次走的是哪个代理"（``proxy_in_use``）—— 97 只有一句笼统的
-        proxy handshake error，不补这两行根本看不出代理配错在哪。
+        proxy handshake error，不补这些信息根本看不出代理配错在哪。
+        整条文案始终单行（换行会被压成空格），日志里不会撑成一大坨。
         """
         detail = curl_error_detail(code, message,
                                    proxy_error=proxy_error,
@@ -1872,7 +2178,7 @@ class Session(SessionShortcuts):
     def _acquire_configured(self, prep: _Prep, tcp_profile: TcpProfile | None):
         """取一个池内句柄并完成全部配置。
 
-        返回 ``(pool, handle, (rcvbuf_plan, tcp_switched, transient_cookies))``。
+        返回 ``(pool, handle, (rcvbuf_plan, tcp_switched))``。
 
         配置失败时句柄**不进池**（:meth:`_Pool.discard` 直接销毁）：
         半个配置的句柄被下一个请求复用会踩到脏状态，比多建一次连接昂贵得多。
@@ -1892,42 +2198,54 @@ class Session(SessionShortcuts):
         self._apply_fingerprint(handle.ptr, prep.fingerprint)
         rcvbuf_plan, tcp_switched = self._apply_tcp(handle, tcp_profile)
         self._apply_handle_options(handle.ptr, prep)
-        transient = self._sync_cookies(handle.ptr, prep, handle.pushed_cookies)
-        return rcvbuf_plan, tcp_switched, transient
+        self._sync_cookies(handle.ptr, prep, handle.pushed_cookies)
+        return rcvbuf_plan, tcp_switched
 
-    def _collect_result(self, handle: "_Handle", prep: _Prep,
-                        transient: Sequence[tuple]):
-        """传输结束后的收尾读数：getinfo + cookie 导出 + 撤掉本次专用 cookie。
+    def _collect_result(self, handle: "_Handle", prep: _Prep):
+        """传输结束后的收尾读数：getinfo + cookie 导出。
 
-        撤临时 cookie 放在 ``finally``：读数中途失败也必须撤，否则这些"只属于本次
-        请求"的 cookie 会留在句柄的 cookie 引擎里。
+        导出必须在句柄回到池里之前做完：句柄是复用的，下一次请求的 cookie 同步
+        会改写引擎，晚一步读就串味了。
         """
-        try:
-            info = _read_info(handle)
-            cookie_dump = lib.get_cookies(handle.ptr)
-        finally:
-            if transient:
-                try:
-                    self._drop_transient_cookies(
-                        handle.ptr, transient, handle.pushed_cookies)
-                except Exception:  # noqa: BLE001 - 撤除失败不改写读数结果
-                    pass
+        info = _read_info(handle)
+        cookie_dump = lib.get_cookies(handle.ptr)
         return info, cookie_dump
 
     def _finish(self, prep: _Prep, info: "_Info", cookie_dump: str,
-                transient: Sequence[tuple], code: int, error: str | None) -> None:
-        """共享收尾：吸收 cookie，然后按 CURLcode 抛对应异常（0 = 正常）。"""
+                code: int, error: str | None,
+                response: Response | None = None) -> Response | None:
+        """共享收尾：吸收 cookie（含删除），然后按 CURLcode 抛对应异常（0 = 正常）。
+
+        ``raise_for_status=True`` 时 4xx/5xx 在这里直接抛（与 curl_cffi 的会话级
+        参数一致）；``discard_cookies=True`` 时这只请求既不读也不写 cookie 罐。
+        """
         if info is None:
             # 结构保证：只有"真的传输完并读过结果"的 transfer 才允许走到这里。
             # 中止/失败一律交付明确异常，不许变成成功空正文或 AttributeError。
             raise NbCurlError(
                 "内部状态错误：本次请求没有收尾信息（不应被当作成功交付）")
-        self.cookies._absorb(cookie_dump, time.time(), frozenset(transient))
+        if not prep.discard_cookies:
+            self.cookies._absorb(cookie_dump, time.time())
+            if response is not None:
+                self._absorb_cookie_deletions(prep, response)
         if code != 0:
             self._raise_for_code(
                 code, error or lib.strerror(code),
                 proxy_error=info.proxy_error,
                 proxy_in_use=_proxy_in_use(prep.proxy, prep.url))
+        return response
+
+    def _absorb_cookie_deletions(self, prep: _Prep, response: Response) -> None:
+        """把响应里 ``Max-Age=0`` / 过期 ``Expires`` 的删除落到会话罐。
+
+        引擎在发送前被清空（:meth:`_sync_cookies`），所以"删掉罐里已有的那条"这类
+        通知它自己不会有；这里直接用响应头的原文补上，重定向中间跳也算。
+        """
+        hops = list(getattr(response, "history", ()) or ()) + [response]
+        for hop in hops:
+            for raw in hop.headers.get_list("set-cookie"):
+                self.cookies.remember_set_cookie(
+                    raw, prep.host, urlsplit(getattr(hop, "url", "") or prep.url).path or "/")
 
     def _request(self, method: str, url: str,
                  **options: Unpack[RequestOptions]) -> Response:
@@ -1940,30 +2258,63 @@ class Session(SessionShortcuts):
         if self._closed:
             raise NbCurlError("Session 已关闭")
 
-        prep = self._prepare(method, _merge_url(url, options.get("params")), options)
+        prep = self._prepare(method, _final_url(url, options.get("params")), options)
         tcp_profile = self._build_tcp(options, prep)
+        if prep.follow_python:
+            return self._follow_redirects(prep, options, tcp_profile)
         if prep.stream:
             return self._request_stream(prep, tcp_profile)
+        return self._perform_one(prep, tcp_profile)
 
+    def _perform_one(self, prep: "_Prep", tcp_profile: Any) -> Response:
+        """发**一跳**（非流式）并收尾：cookie 吸收 / 错误码映射都在这里。"""
         pool, handle, staged = self._acquire_configured(prep, tcp_profile)
-        rcvbuf_plan, tcp_switched, transient = staged
+        rcvbuf_plan, tcp_switched = staged
         reusable = False
         try:
             code, status, content, raw_headers, error, wall = self._perform(
                 handle, prep, rcvbuf_plan, tcp_switched)
             self._verify_tcp(handle, code, tcp_profile, rcvbuf_plan)
-            info, cookie_dump = self._collect_result(handle, prep, transient)
+            info, cookie_dump = self._collect_result(handle, prep)
             reusable = True
         finally:
-            # 收尾/读数中途抛异常 = 这只句柄的状态已不确定（临时 cookie、
-            # 只读了一半的传输都在上面）：销毁而不是放回池里污染下一个请求。
+            # 收尾/读数中途抛异常 = 这只句柄的状态已不确定（只读了一半的传输
+            # 也在上面）：销毁而不是放回池里污染下一个请求。
             if reusable:
                 pool.release(handle)
             else:
                 pool.discard(handle)
 
-        self._finish(prep, info, cookie_dump, transient, code, error)
-        return _build_response(prep, info, status, content, raw_headers, wall, cookie_dump)
+        response = _build_response(prep, info, status, content, raw_headers, wall, cookie_dump)
+        self._finish(prep, info, cookie_dump, code, error, response)
+        return response
+
+    def _follow_redirects(self, prep: "_Prep", options: Mapping[str, Any],
+                          tcp_profile: Any) -> Response:
+        """在 Python 侧按浏览器矩阵跟重定向（只用于非原生方法）。
+
+        libcurl 对 ``CUSTOMREQUEST`` 的自定义方法只会"语义切 GET、方法串留着"，
+        所以 303 该降级成 GET 的情况它降不下来（PUT/PATCH/DELETE 都会带着方法名
+        发个空 body 出去）。这里改成逐跳自己发，规则见 :func:`next_redirect_hop`。
+        """
+        hops: list[Response] = []
+        while True:
+            response = self._perform_one(prep, tcp_profile)
+            method, next_url, next_options = next_redirect_hop(prep, options, response)
+            if method is None:
+                if hops:
+                    response.history = hops + list(response.history or [])
+                    response.redirect_count = len(response.history)
+                return response
+            if len(hops) >= max(0, int(prep.max_redirects or 0)):
+                raise TooManyRedirects(
+                    "重定向次数超限（max_redirects=%d）：%s" % (prep.max_redirects, next_url))
+            hops.append(response)
+            prep = self._prepare(method, next_url, next_options)
+            prep.redirects = False
+            prep.follow_python = True
+            prep.stream = False
+            tcp_profile = self._build_tcp(next_options, prep)
 
     def _stream_reader(self, prep: _Prep) -> tuple[Response, "_StreamBody"]:
         """建好流式响应与读取器（**不启动**），并确保它已被登记进 ``_streams``。

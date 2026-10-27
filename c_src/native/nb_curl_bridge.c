@@ -714,14 +714,28 @@ int easy_set_method(nb_easy* e, const char* method)
 /* perform 前统一应用 method + body，顺序敏感：
    1) 先定 body 语义（POSTFIELDS 会隐式切 POST）
    2) 再按方法复位（HTTPGET / NOBODY）
-   3) 最后设 CUSTOMREQUEST 方法字符串，确保不被前面的 setopt 覆盖 */
+   3) 最后按方法决定要不要设 CUSTOMREQUEST
+
+   方法语义（**重定向行为要跟浏览器一致**）：
+   - POST / HEAD / 普通 GET 走 libcurl 自己的 httpreq，不设 CUSTOMREQUEST：
+     这样重定向才是浏览器口径 —— 301/302/303 把 POST 降级成 GET（丢 body），
+     307/308 保留 POST + body。设了 CUSTOMREQUEST 时，libcurl 在 302 之后会把
+     *语义* 切成 GET（丢掉 POSTFIELDS），但方法串还留着 "POST"，线上就成了
+     "空 body 的 POST"（登录/表单站点直接 400）。
+   - 其余方法（PUT/PATCH/DELETE/OPTIONS…）libcurl 没有原生开关，只能 CUSTOMREQUEST；
+     再用 POSTREDIR 让 301/302 保留方法 + body（浏览器对 PUT 的 302 就是不降级）。
+     303 浏览器会把任何方法降级为 GET，而 CUSTOMREQUEST 不跟着改 —— 已知残差。
+   - GET + body 是"浏览器做不到、我们允许"的能力：这时必须 CUSTOMREQUEST，
+     否则 POSTFIELDS 会把方法顶成 POST。 */
 static void nb_apply_request(CURL* c, HandleData* hd)
 {
     const char* m = hd->method ? hd->method : "GET";
     int is_post = (strcmp(m, "POST") == 0);
     int is_head = (strcmp(m, "HEAD") == 0);
+    int is_get = (strcmp(m, "GET") == 0);
+    int has_body = (hd->post_len > 0);
 
-    if(hd->post_len > 0) {
+    if(has_body) {
         curl_easy_setopt(c, CURLOPT_POSTFIELDS, hd->post_body);
         curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)hd->post_len);
     }
@@ -738,7 +752,17 @@ static void nb_apply_request(CURL* c, HandleData* hd)
     }
 
     curl_easy_setopt(c, CURLOPT_NOBODY, is_head ? 1L : 0L);
-    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, m);
+
+    if((is_post || is_head) || (is_get && !has_body)) {
+        /* 原生语义：同时清掉上一请求可能残留的自定义方法 */
+        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, NULL);
+        curl_easy_setopt(c, CURLOPT_POSTREDIR, 0L);
+    }
+    else {
+        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, m);
+        curl_easy_setopt(c, CURLOPT_POSTREDIR,
+                         (long)(CURL_REDIR_POST_301 | CURL_REDIR_POST_302));
+    }
 }
 
 /* 多行文本头 -> slist */

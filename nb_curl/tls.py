@@ -5,11 +5,11 @@
 ==========================================================  =====================
 表                                                              源码出处
 ==========================================================  =====================
-TLS 套件（37 个，含 TLS1.2 及以下）                             BoringSSL ssl/ssl_cipher.cc kCiphers[]
+TLS 套件（34 个，TLS1.2 及以下；另有 3 个 TLS1.3 套件）              BoringSSL ssl/ssl_cipher.cc kCiphers[]
 TLS 1.3 套件（3 个，无 CCM）                                    同上（0x1301-0x1303）
 椭圆曲线 / 密钥协商组（9 个）                                   BoringSSL ssl/ssl_key_share.cc kNamedGroups[]
 签名算法（16 个，C 层实际接受的名字）                           curl lib/vtls/openssl.c kSignatureAlgorithmNames[]
-TLS 扩展（31 个，extension_order 只认这些 id）                  BoringSSL ssl/extensions.cc kExtensions[]
+TLS 扩展（32 个，extension_order 只认这些 id）                  BoringSSL ssl/extensions.cc kExtensions[]
 TLS 版本（1.0/1.1/1.2/1.3，默认下限 1.2）                      BoringSSL ssl/ssl_versions.cc
 证书压缩算法（brotli/zlib/zstd）                                curl lib/vtls/openssl.c cert_compress_algs[]
 ==========================================================  =====================
@@ -281,7 +281,7 @@ def split_list(text: str, seps: str = ":,") -> list[str]:
 # 自省 API
 # --------------------------------------------------------------------------- #
 def supported_ciphers() -> dict[int, str]:
-    """TLS 1.2 及以下 cipher 套件（id -> IANA 名称），共 37 个。"""
+    """TLS 1.2 及以下 cipher 套件（id -> IANA 名称），共 34 个。"""
     return dict(CIPHER_SUITES)
 
 
@@ -301,7 +301,7 @@ def supported_signature_algorithms() -> dict[int, str]:
 
 
 def supported_extensions() -> dict[int, str]:
-    """extension_order 允许的 TLS 扩展（id -> 名称），共 31 个。"""
+    """extension_order 允许的 TLS 扩展（id -> 名称），共 32 个。"""
     return dict(TLS_EXTENSIONS)
 
 

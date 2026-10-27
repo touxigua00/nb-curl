@@ -256,6 +256,20 @@ def _retry_fs(fn, what: str, attempts: int = 12, delay: float = 0.35):
     )
 
 
+def _bridge_include_dir(root: str) -> str:
+    """桥接层头文件所在目录。
+
+    真身是 ``<项目根>/c_src/native/``（``build/windows/build_native.sh`` 编译的就是它）；
+    ``<项目根>/native/`` 是 9 月遗留的副本，头文件早就没跟着更新了
+    （缺 ``nb_poll_item`` / ``nb_sock_info`` 等），拿它当 include 目录会让
+    cffi 扩展以"语法错误"的形式失败。这里优先用真身，只在真身不存在时回退。
+    """
+    real = os.path.join(root, "c_src", "native")
+    if os.path.isfile(os.path.join(real, "nb_curl_bridge.h")):
+        return real
+    return os.path.join(root, "native")
+
+
 def _clean_stale_artifacts(here: str, build_dir: str) -> list[str]:
     """删掉上一次的扩展产物。
 
@@ -353,7 +367,7 @@ def build(verbose: bool = True) -> str:
         source='#include "nb_curl_bridge.h"\n',
         libraries=["nb_curl_native"],
         library_dirs=library_dirs,
-        include_dirs=[os.path.join(root, "native")],
+        include_dirs=[_bridge_include_dir(root)],
         extra_link_args=extra_link_args,
     )
 
@@ -375,6 +389,29 @@ def build(verbose: bool = True) -> str:
 
     if not os.path.isfile(out):
         raise SystemExit("CFFI 扩展产物缺失：%s" % out)
+
+    # 改名：统一成**与 Python 版本无关**的文件名。
+    #
+    # 这份扩展的内容本来就是稳定 ABI —— cffi 的 setuptools 集成默认就开
+    # ``py_limited_api=True``（见 cffi/setuptools_ext._set_py_limited_api）：
+    # Windows 产物只导入 ``python3.dll``（12 个稳定 ABI 符号，没有任何 python311.dll），
+    # Linux 产物的未定义符号同样只有那 12 个。实测：用 3.11 编出来的 .pyd
+    # 直接换到 3.14 上加载，264 条回归全过。
+    #
+    # 但 setuptools 按 EXT_SUFFIX 起了个带版本的名字
+    # （``.cp311-win_amd64.pyd`` / ``.cpython-311-x86_64-linux-gnu.so``），
+    # 而 import 机制**只认当前解释器那个后缀** —— 于是同一个二进制在别的 Python 上
+    # 等于不存在，白白回退到 ctypes。改掉名字，一份产物就能被 3.9~3.x 全部版本加载，
+    # 不需要给每个 Python 版本各编一次。
+    #   * Windows：EXTENSION_SUFFIXES 里只有 ``.pyd``，去掉版本段即可；
+    #   * Linux / macOS：后缀表里有 ``.abi3.so``。
+    _final_name = "_nb_curl_cffi" + (".pyd" if os.name == "nt" else ".abi3.so")
+    final = os.path.join(here, _final_name)
+    if os.path.abspath(out) != os.path.abspath(final):
+        if os.path.isfile(final):
+            _retry_fs(lambda: os.unlink(final), "删除旧产物 %s" % _final_name)
+        _retry_fs(lambda: os.replace(out, final), "重命名扩展产物 -> %s" % _final_name)
+        out = final
 
     # 落位后再做一次运行期自检：新扩展必须能看到 multi ABI v3，否则说明它链接到了
     # 旧的导入库（构建静默错位，不如在这里直接失败）。

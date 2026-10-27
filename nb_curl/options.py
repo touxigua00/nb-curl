@@ -4,6 +4,14 @@
 自定义程度拉满。所有 option 编号与类型标记由 ``_curlopt_generated.py`` 自动从 curl.h
 提取，避免手抄出错。
 
+**怎么导入**：``nb_curl`` 包里的 ``options`` 这个名字是 HTTP 的 OPTIONS **函数**
+（requests 习惯，见 :mod:`nb_curl.session`），它会遮蔽同名子模块，所以
+``nb_curl.options.CurlOpt`` / ``import nb_curl.options as opt`` 都拿不到本模块。
+按名字导入即可，两种写法都行::
+
+    from nb_curl.options import CurlOpt, SAFE_OPTIONS     # 推荐
+    from nb_curl import CurlOpt                            # 顶层也导出了 CurlOpt
+
 安全模型（重要）：
 
 * 每个 option 的值类型（long/string/slist/off_t/回调/blob）由 curl.h 的
@@ -192,8 +200,8 @@ def apply_curl_options(lib, handle, options, *, allow_dangerous: bool = False) -
             if not allow_dangerous:
                 raise ValueError(
                     "%s 不在白名单内。如确需设置，传 curl_options(..., "
-                    "allow_dangerous=True)；白名单见 nb_curl.options.SAFE_OPTIONS。"
-                    % opt_name)
+                    "allow_dangerous=True)；白名单见 from nb_curl.options import "
+                    "SAFE_OPTIONS。" % opt_name)
 
         code = _dispatch(lib, handle, opt_int, vtype, value)
         if code != 0:

@@ -105,11 +105,16 @@ class RequestOptions(TypedDict, total=False):
 
     headers: Mapping[str, Any] | None
     """本次请求头。覆盖会话级与预设浏览器头里的同名项（位置保持在原处），
-    新头追加在末尾。值给 ``None`` 表示删掉该默认头。"""
+    新头追加在末尾。值给 ``None`` 表示删掉该默认头。
+
+    ``Cookie`` 也在这张表里：**写在哪就发在哪**、值原样、只发一条
+    （不会被改写到最前面，也不会在 HTTP/2 下被拆成多条）。"""
 
     cookies: Mapping[str, Any] | None
     """本次请求的 cookie（dict），叠加在 ``session.cookies`` 之上；
-    响应的 Set-Cookie 会自动记回会话。"""
+    发送顺序就是 dict 的顺序（显式给的在前，会话罐里命中该主机 / 路径 / Secure 的
+    按罐内顺序跟在后面，同名不重复），整体拼成**一条** ``Cookie:`` 头、追加在
+    你自己那些头的末尾。响应的 Set-Cookie 会自动记回会话。"""
 
     data: Any
     """请求体。dict → ``application/x-www-form-urlencoded``；
@@ -157,6 +162,13 @@ class RequestOptions(TypedDict, total=False):
     max_redirects: int | None
     """最大重定向次数。会话级默认 30。"""
 
+    credentials: str | None
+    """cookie 的携带策略，语义对齐浏览器 ``fetch(..., {credentials})``：
+
+    * ``None`` / ``"include"`` / ``"same-origin"`` —— 正常发 cookie、记住响应里的
+      ``Set-Cookie``（裸 HTTP 客户端没有"页面来源"，所以这两档等价）；
+    * ``"omit"`` —— 本次请求**既不发也不记** cookie。"""
+
     auth: Any
     """HTTP 基本认证：``("user", "password")`` 或 ``"user:password"``。"""
 
@@ -178,6 +190,8 @@ class RequestOptions(TypedDict, total=False):
 
     diy_fp: Mapping[str, Any] | None
     """字段级覆盖（最细的一档），如 ``{"tls_grease": True, "tls_trust_anchors": ""}``。
+    HTTP/2 帧可以整帧换：``{"http2_frames": "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p"}``
+    或 ``{"http2_frames": {"settings": {...}, "window_updates": {"0": ...}, "order": "m,a,s,p"}}``。
     可用键与取值范围用 ``nb_curl.diy_fp_fields()`` 查。"""
 
     fp_file: str | _os.PathLike | Mapping[str, Any] | None
@@ -204,6 +218,25 @@ class RequestOptions(TypedDict, total=False):
     """HTTP/2 的 HEADERS 帧要不要带已废弃的 RFC 7540 优先级字段
     （Chrome 是 ``0x25``，不带是 ``0x05``）。``None`` = 跟随预设
     （Chrome 系开、Safari 系关），``True`` / ``False`` = 强制。"""
+
+    header_order: str | Sequence[str] | None
+    """请求头**发送顺序**（与 ``impersonate`` 同级的显式参数，会话级/请求级都收）。
+
+    写法：``"Host,Connection,sec-ch-ua,..."`` 逗号分隔串，或
+    ``["Host", "Connection", "sec-ch-ua", ...]`` 列表（大小写不敏感，重复名只留第一个）。
+
+    语义（C 层 ``CURLOPT_HTTPHEADER_ORDER``）：**名单里的头按给定顺序排到最前，
+    名单外的头保持原有相对顺序追加在后**——所以想完全对齐某个模板，要把它发的
+    每个头都列进去。``host`` 会被强制提到第一位（浏览器与 curl 默认都是 Host 第一）。
+
+    ``None`` = 跟随 ``impersonate`` 预设（浏览器预设自带顺序）；显式传值则**压过**
+    预设与 ``diy_fp={"header_order": …}``。典型用途：按资源类型切模板（导航 vs
+    XHR/子资源），见 Chrome 155 实测的两套顺序。"""
+
+    http3_permute_extensions: bool | None
+    """HTTP/3 的 QUIC ClientHello 要不要**逐连接随机打乱 TLS 扩展顺序**
+    （``CURLOPT_HTTP3_SSL_PERMUTE_EXTENSIONS``）。``None`` = 跟随预设
+    （Chrome 系开、其余关），``True`` / ``False`` = 强制。"""
 
     ech: str | bool | None
     """ECH（Encrypted ClientHello）。``True`` = 尽力（配合 ``doh`` 从 HTTPS RR 取配置），
@@ -242,7 +275,8 @@ class RequestOptions(TypedDict, total=False):
     由 ``response.close()`` 一起关掉（也可以写 ``with nb_curl.get(..., stream=True) as r:``）。"""
 
     curl_options: Mapping[Any, Any] | None
-    """逃生口：``{CurlOpt.X: value}`` 直接 setopt，见 :mod:`nb_curl.options`。
+    """逃生口：``{CurlOpt.X: value}`` 直接 setopt。``CurlOpt`` 从顶层拿即可
+    （``nb_curl.CurlOpt``）；白名单用 ``from nb_curl.options import SAFE_OPTIONS`` 看。
     会破坏指纹或与专用参数冲突的项默认被拦，要放行得配 ``allow_dangerous_options=True``。"""
 
     # -- TCP 层画像（JA4T） ------------------------------------------------ #

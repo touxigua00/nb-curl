@@ -102,20 +102,22 @@
 #      options struct so presets can turn it on.
 #
 # lib/vquic/cf-ngtcp2.c
-#  17. (2026-09-16 曾移除，2026-09-17 恢复) H3 custom-settings 支持：
-#      h3_apply_setting / h3_setting_supported / h3_rand_u32 /
+#  17. (2026-09-16 鏇剧Щ闄わ紝2026-09-17 鎭㈠) H3 custom-settings 鏀寔锛?#      h3_apply_setting / h3_setting_supported / h3_rand_u32 /
 #      h3_generate_grease_setting / h3_settings_count / populate_h3_settings
-#      与 init_ngh3_conn 里的 nghttp3_conn_submit_settings 调用，即
-#      curl-impersonate 原版实现（CURLOPT_HTTP3_SETTINGS 串
-#      "id:value;..." + "GREASE" 令牌）。当时移除的原因是这些符号不在
-#      任何官方版 nghttp3 里；现在我们把 curl-impersonate 的 nghttp3
-#      补丁重定基到 v1.18（deps/patches/nghttp3.patch，应用于
-#      deps/sources/nghttp3-src），补齐了 nghttp3_conn_submit_settings
-#      公开 API，于是原样恢复。chrome150/155 与 firefox147 预设的
-#      H3 SETTINGS 指纹（含 GREASE 条目）由此生效；未设置
-#      CURLOPT_HTTP3_SETTINGS 时行为与官方 curl 一致。
-#
+#      涓?init_ngh3_conn 閲岀殑 nghttp3_conn_submit_settings 璋冪敤锛屽嵆
+#      curl-impersonate 鍘熺増瀹炵幇锛圕URLOPT_HTTP3_SETTINGS 涓?#      "id:value;..." + "GREASE" 浠ょ墝锛夈€傚綋鏃剁Щ闄ょ殑鍘熷洜鏄繖浜涚鍙蜂笉鍦?#      浠讳綍瀹樻柟鐗?nghttp3 閲岋紱鐜板湪鎴戜滑鎶?curl-impersonate 鐨?nghttp3
+#      琛ヤ竵閲嶅畾鍩哄埌 v1.18锛坉eps/patches/nghttp3.patch锛屽簲鐢ㄤ簬
+#      deps/sources/nghttp3-src锛夛紝琛ラ綈浜?nghttp3_conn_submit_settings
+#      鍏紑 API锛屼簬鏄師鏍锋仮澶嶃€俢hrome150/155 涓?firefox147 棰勮鐨?#      H3 SETTINGS 鎸囩汗锛堝惈 GREASE 鏉＄洰锛夌敱姝ょ敓鏁堬紱鏈缃?#      CURLOPT_HTTP3_SETTINGS 鏃惰涓轰笌瀹樻柟 curl 涓€鑷淬€?#
 # lib/vquic/cf-ngtcp2-cmn.c
+#  19. (0.3.2) chrome155: http3_tls_extension_order gains 51764 (0xca34,
+#      trust_anchors). The explicit order list doubles as a whitelist - anything
+#      not listed is never emitted - so H3 ClientHellos never carried the
+#      extension even though CURLOPT_TLS_TRUST_ANCHORS had been applied to the
+#      SSL_CTX. Only chrome155 lists it: the extension first appeared in Chrome
+#      152 (a real Chrome 150 ClientHello has no 51764), and chrome145 / 146 /
+#      150 must not advertise it. Firefox does not send it either.
+#
 #  18. Removed curl-impersonate's raw QUIC transport params override block
 #      (ngtcp2_conn_set_local_transport_params_raw +
 #      ngtcp2_transport_params_raw) in cf_ngtcp2_ctx_setup. These symbols
@@ -539,8 +541,7 @@
  
    CF_DATA_SAVE(save, cf, data);
  
-+  /* Curl_cffi rework: browsers never close a healthy connection first —
-+   * they wait for the peer FIN and reply with a bare FIN. A library that
++  /* Curl_cffi rework: browsers never close a healthy connection first 鈥?+   * they wait for the peer FIN and reply with a bare FIN. A library that
 +   * proactively sends GOAWAY+close_notify+FIN is detectable. Wait up to
 +   * ~300ms for the peer FIN, interleaving reads so a buffered close_notify
 +   * does not fool us into thinking the peer is still alive. */
@@ -631,7 +632,7 @@
        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
        "Sec-Fetch-Site: none",
        "Sec-Fetch-Mode: navigate",
-@@ -1041,6 +1046,130 @@
+@@ -1041,6 +1046,133 @@
      .form_boundary = "webkit",
    },
    {
@@ -733,7 +734,11 @@
 +    .http3_pseudo_headers_order = "masp",
 +    .quic_cid_length = "webkit",
 +    .quic_transport_parameters = "1:30000;3:1472;4:15728640;5:6291456;6:6291456;7:6291456;8:100;9:103;15:;17:1@1,GREASE;32:65536;12584:0x4f524947;GREASE",
-+    .http3_tls_extension_order = "0-10-13-16-27-43-45-51-57-17613-65037",
++    /* Curl_cffi rework (nb-curl): 见文件头第 19 条：这个列表同时也是白名单，
++     * 不写进去的扩展根本不会发。Chrome 从 152 起 QUIC 也带 trust_anchors
++     * (51764 / 0xca34)，漏掉它才让 H3 侧一直没有；只有 chrome155 该列它。 */
++    .http3_tls_extension_order =
++      "0-10-13-16-27-43-45-51-57-17613-51764-65037",
 +    .ech = "true",
 +    /* The 28 trust anchor IDs of Chrome's built-in root store, in the order a
 +     * live Chrome 155 sends them: sorted by the encoded RELATIVE-OID bytes,
@@ -762,7 +767,7 @@
      .target = "chrome99",
      .alias = "chrome99",
      .httpversion = CURL_HTTP_VERSION_2_0,
-@@ -1471,8 +1600,9 @@
+@@ -1471,8 +1603,9 @@
        "TLS_RSA_WITH_AES_256_GCM_SHA384:"
        "TLS_RSA_WITH_AES_128_CBC_SHA:"
        "TLS_RSA_WITH_AES_256_CBC_SHA",
@@ -913,7 +918,7 @@
 +    bool input_pending;
 +
 +    /* If the peer already sent a raw TCP FIN (no TLS close_notify), do NOT
-+     * write our close_notify — writing after the peer half-closed is a
++     * write our close_notify 鈥?writing after the peer half-closed is a
 +     * "half-close write" and reveals a library. Just mark it closed. */
 +    if(!cf->next->cft->is_alive(cf->next, data, &input_pending)) {
 +      connssl->peer_closed = TRUE;

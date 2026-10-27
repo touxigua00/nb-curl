@@ -10,7 +10,9 @@ CFFI API 模式在**编译期**把 Python 调用直接绑定到 C 函数（生�
 注意：HTTP 请求的耗时几乎全在网络/TLS，"FFI 快 1.2x" 对端到端时延的影响 <0.1%。
 选它的主要理由是类型安全与代码整洁，不是吞吐。
 
-扩展产物：``nb_curl/_nb_curl_cffi*.pyd``
+扩展产物：``nb_curl/_nb_curl_cffi.pyd``（Windows）/ ``_nb_curl_cffi.abi3.so``（Linux、macOS）。
+名字里**故意不带 Python 版本号**：cffi 默认按稳定 ABI（``py_limited_api``）编译，
+Windows 上只导入 ``python3.dll``，所以同一份产物所有 Python 3.x 都能加载。
 """
 
 from __future__ import annotations

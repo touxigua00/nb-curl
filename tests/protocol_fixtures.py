@@ -92,7 +92,12 @@ def _h2_new_server_connection():
     except Exception:  # noqa: BLE001 - 老版本/裁剪安装时退回默认
         return _h2_conn.H2Connection()
     try:
-        return _h2_conn.H2Connection(config=_H2Config(client_side=False))
+        # normalize_inbound_headers=False：h2 库默认会把收到的所有 ``cookie`` 字段
+        # 合并成一条、并挪到 header 块**末尾**（utilities._combine_cookie_fields，
+        # 这是 RFC 7540 §8.1.2.5 接收端的正规化）。夹具要看的正是"客户端到底发了几条、
+        # 按什么顺序"，被它整理过就什么都看不出来了，所以这里必须关掉。
+        return _h2_conn.H2Connection(
+            config=_H2Config(client_side=False, normalize_inbound_headers=False))
     except TypeError:  # h2 < 4.4：client_side 还是 H2Connection 的参数
         return _h2_conn.H2Connection(client_side=False)
 
@@ -364,11 +369,45 @@ class TLSHttpServer:
 # --------------------------------------------------------------------------- #
 # TLS + 真实 ALPN 协商的 HTTP/2（保持连接、并发多 stream、连接计数）
 # --------------------------------------------------------------------------- #
+_H2_CLIENT_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+
+def _h2_scan_frames(data: bytes) -> list:
+    """把客户端明文（preface + 帧）切成帧；尾部不完整的帧直接丢掉。
+
+    只做 HTTP/2 通用帧头解析（RFC 9113 §4.1），不关心 HPACK 内容。
+    """
+    out: list = []
+    i = len(_H2_CLIENT_PREFACE) if data.startswith(_H2_CLIENT_PREFACE) else 0
+    while i + 9 <= len(data):
+        length = int.from_bytes(data[i:i + 3], "big")
+        ftype = data[i + 3]
+        flags = data[i + 4]
+        stream = int.from_bytes(data[i + 5:i + 9], "big") & 0x7FFFFFFF
+        payload = data[i + 9:i + 9 + length]
+        if len(payload) < length:
+            break                      # 帧还没收全
+        out.append({"type": ftype, "flags": flags, "stream": stream, "payload": payload})
+        i += 9 + length
+    return out
+
+
+def _h2_settings_entries(payload: bytes) -> list:
+    """SETTINGS 载荷 -> ``[(id, value), ...]``（保持线上的条目顺序）。"""
+    return [(int.from_bytes(payload[i:i + 2], "big"),
+             int.from_bytes(payload[i + 2:i + 6], "big"))
+            for i in range(0, len(payload) - 5, 6)]
+
+
 class H2Server:
     """真·HTTP/2 服务端：ALPN 只提供 ``h2``，不匹配就拒绝（杜绝静默降级）。
 
     一条连接上由 ``h2`` 状态机驱动，可同时处理多个 stream，响应后保持连接不关，
     便于核对客户端的连接复用与多路复用计数。
+
+    另外按**线上原始字节**记下客户端发的 SETTINGS 条目（保序）、WINDOW_UPDATE
+    增量和伪头顺序 —— 这三样就是 HTTP/2 指纹的全部内容，用它们可以核对
+    ``diy_fp={"http2_frames": ...}`` / ``akamai=`` 有没有真的落到帧上。
     """
 
     def __init__(self, certfile, keyfile, host: str = HOST) -> None:
@@ -377,6 +416,11 @@ class H2Server:
         self.refusals: list = []         # ALPN 不匹配 / TLS 握手失败
         self.errors: list = []           # 协商成功之后才出的问题（HTTP/2 协议层等）
         self.streams = 0
+        # 最近一个 stream 收到的 header **原样列表**（保序、保重复）。h2 允许同名头
+        # 出现多次（Cookie 就允许被拆成多条），折叠成 dict 之后这件事就看不见了。
+        self.last_request_headers: list = []
+        # 最近一条连接上客户端发的伪头顺序（"masp" 这种），以及 SETTINGS/WINDOW_UPDATE
+        self.last_pseudo_order: str = ""
 
         self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self._ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -481,6 +525,8 @@ class H2Server:
         h2 = _h2_new_server_connection()
         h2.initiate_connection()
         conn.sendall(h2.data_to_send())
+
+        raw_all = b""          # 客户端明文（preface + 帧），用来抓 SETTINGS/WINDOW_UPDATE
         conn.settimeout(15)   # 保持连接：空闲 15s 才收摊，不是一次性请求-响应
 
         while not self._stop.is_set():
@@ -492,6 +538,9 @@ class H2Server:
                 break
             if not data:
                 break
+            if len(raw_all) < 65536:
+                raw_all += data
+            self._scan_client_frames(state, raw_all)
             events = h2.receive_data(data)
             terminated = False
             for ev in events:
@@ -507,22 +556,49 @@ class H2Server:
             if terminated:
                 break
 
+    def _scan_client_frames(self, state: dict, raw: bytes) -> None:
+        """从客户端原始字节里提出 SETTINGS（保序）与 WINDOW_UPDATE。"""
+        frames = _h2_scan_frames(raw)
+        with self._lock:
+            if state.get("settings") is None:
+                for fr in frames:
+                    # type 4 = SETTINGS；带 ACK(0x1) 的那种载荷为空，跳过
+                    if fr["type"] == 0x4 and not (fr["flags"] & 0x1):
+                        state["settings"] = _h2_settings_entries(fr["payload"])
+                        state["settings_flags"] = fr["flags"]
+                        break
+            wu = [(fr["stream"], int.from_bytes(fr["payload"][:4], "big"))
+                  for fr in frames if fr["type"] == 0x8 and len(fr["payload"]) >= 4]
+            if wu:
+                state["window_updates"] = wu
+
     def _respond(self, h2, conn, ev, state: dict) -> None:
         # h2 的 header_encoding 默认是 utf-8（拿到 str），老版本/显式配置下可能是
         # bytes；两种都要能处理，否则修好 client_side 之后这里会以 AttributeError
         # 形式炸成"协议层错误"，把夹具问题伪装成客户端问题。
         headers = {}
+        raw_fields: list[tuple[str, str]] = []
         for k, v in ev.headers:
             if isinstance(k, bytes):
                 k = k.decode("latin-1")
             if isinstance(v, bytes):
                 v = v.decode("latin-1")
             headers[k.lower()] = v
+            raw_fields.append((k.lower(), v))
+        cookie_fields = [v for k, v in raw_fields if k == "cookie"]
+        pseudo_order = "".join(k[1:2] for k, _ in raw_fields if k.startswith(":"))
+        with self._lock:
+            self.last_request_headers = raw_fields
+            self.last_pseudo_order = pseudo_order
+            state["pseudo_order"] = pseudo_order
         body = json.dumps({
             "server": "h2", "stream_id": ev.stream_id,
             "path": headers.get(":path", ""), "method": headers.get(":method", ""),
             "authority": headers.get(":authority", ""),
             "stream_seq": state["streams"] + 1,
+            # 原样回显：同名头出现了几次、按什么顺序出现，测试直接断言这两件事
+            "header_fields": [[k, v] for k, v in raw_fields],
+            "cookie_fields": cookie_fields,
         }).encode("utf-8")
         h2.send_headers(ev.stream_id, [
             (":status", "200"),
@@ -543,6 +619,19 @@ class H2Server:
     def max_streams_one_connection(self) -> int:
         with self._lock:
             return max([c["streams"] for c in self.connections], default=0)
+
+    def last_settings(self) -> list:
+        """最近一条连接上客户端 SETTINGS 的 ``[(id, value), ...]``（保序）。"""
+        with self._lock:
+            return list(self.connections[-1].get("settings") or []) if self.connections else []
+
+    def last_settings_as_dict(self) -> dict:
+        return dict(self.last_settings())
+
+    def last_window_updates(self) -> list:
+        """最近一条连接上客户端发的 ``[(stream_id, increment), ...]``。"""
+        with self._lock:
+            return list(self.connections[-1].get("window_updates") or []) if self.connections else []
 
     def describe(self) -> dict:
         with self._lock:

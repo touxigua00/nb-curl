@@ -87,6 +87,7 @@ _DIY_FP_KEYS = {
     "http2_stream_exclusive",
     "http2_no_priority",
     "http2_headers_priority",
+    "http2_frames",
     "header_order",
     "split_cookies",
     "enable_alps",
@@ -159,6 +160,17 @@ DIY_FP_SPEC: dict[str, tuple[str, str]] = {
         "（E=1 / 依赖=0 / 权重=256），即 Chrome 的 HEADERS flags=0x25；"
         "默认跟随 impersonate 预设（Chrome 开、Safari 关），"
         "与 http2_no_priority=True 互斥。权重用 http2_stream_weight 改"),
+    "http2_frames": (
+        "dict 或 str",
+        "HTTP/2 帧整体自定义（SETTINGS / WINDOW_UPDATE / PRIORITY / 伪头顺序），"
+        "格式与 akamai 指纹同源。字符串写法 'SETTINGS|WINDOW_UPDATE|PRIORITY|ORDER'，"
+        "如 '1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p'（第 3 段 = PRIORITY 帧，"
+        "写 0 表示不发）；字典写法 {'settings': …, 'window_updates': …, 'order': …}，"
+        "可选第 4 个键 'priority'。settings 收 'id:value;…' 字符串，"
+        "或 {'HEADER_TABLE_SIZE': 65536, 'ENABLE_PUSH': 0} 这类字典（按写入顺序发出）；"
+        "window_updates 收整数或 {'0': 15663105}（只有连接级窗口）；"
+        "order 收 'm,a,s,p' / 'masp' / ['m','a','s','p']。"
+        "与 HTTP 版本无关地生效：走 H2 时才是线上帧，H1 下只影响连接建立后的无用设置"),
     "header_order": (
         "str 或 list[str]（'a,b' 与 ['a','b'] 等价）",
         "普通请求头的发送顺序（头名，大小写不敏感）。列出的头按你给的顺序排到最前，"
@@ -166,7 +178,11 @@ DIY_FP_SPEC: dict[str, tuple[str, str]] = {
         "**host 永远排在最前**：名单里没写会自动补在最前，写在别处会被提上来，重复项只留一份"),
     "split_cookies": (
         "bool",
-        "是否按浏览器风格把 Cookie 头拆成多行发送"),
+        "是否把 Cookie 头拆成多行发送（默认**关**：一条一条对得上，见下）。"
+        "只作用于内建 cookie 引擎那一路（会话罐 / Set-Cookie 学到的）；"
+        "用户显式给的 Cookie 头永远是原样的一条 header 行，不受它影响。"
+        "打开后 HTTP/2 下引擎 cookie 会一条一对（Firefox 的做法，RFC 9113 §8.2.3 允许，"
+        "接收方应当用 '; ' 拼回去）—— 但按\"同名头覆盖\"处理的服务端会只剩最后一条"),
     "enable_alps": (
         "bool",
         "是否启用 ALPS（application_settings）扩展"),
@@ -309,6 +325,193 @@ def _validate_http2_settings(settings: str, param: str = "akamai/SETTINGS") -> N
             )
 
 
+# HTTP/2 SETTINGS 名 -> id（diy_fp 里允许 {"HEADER_TABLE_SIZE": 65536} 这种写法）
+_HTTP2_SETTINGS_BY_NAME: dict[str, int] = {
+    name: sid for sid, (name, _lo, _hi) in _HTTP2_SETTINGS_SPEC.items()
+}
+
+# diy_fp["http2_frames"] 字典写法里认的键（含几个等价别名）
+_HTTP2_FRAMES_KEYS = {
+    "settings",
+    "window_updates", "window_update",
+    "order", "pseudo_header_order", "pseudo_headers_order",
+    "priority",
+}
+
+
+def _normalize_http2_settings(value: Any, param: str) -> str:
+    """SETTINGS 帧：收 ``"1:65536;2:0"`` 字符串或 ``{名称/id: 值}`` 字典。
+
+    字典按**写入顺序**拼成 ``id:value;...``（Chrome 的 SETTINGS 条目顺序本身
+    也是指纹的一部分，所以不做排序）。名称大小写不敏感，id 直接用数字也行。
+    """
+    if isinstance(value, str):
+        settings = value.replace(",", ";").strip()
+        if not settings:
+            raise FingerprintError("%s 不能为空" % param)
+        _validate_http2_settings(settings, param=param)
+        return settings
+    if isinstance(value, Mapping):
+        if not value:
+            raise FingerprintError("%s 不能为空字典" % param)
+        parts: list[str] = []
+        for key, raw in value.items():
+            token = str(key).strip()
+            if token and not token.lstrip("-").isdigit():
+                name = token.upper()
+                sid = _HTTP2_SETTINGS_BY_NAME.get(name)
+                if sid is None:
+                    raise FingerprintError(
+                        "%s: 未知的 HTTP/2 设置名 %r。可用名称: %s（也可以直接写 id）"
+                        % (param, key, ", ".join(sorted(_HTTP2_SETTINGS_BY_NAME)))
+                    )
+            else:
+                sid = _int_field(key, "%s 的键" % param, 0, 0xFFFF)
+            svalue = _int_field(raw, "%s[%s]" % (param, key), 0, 0xFFFFFFFF)
+            parts.append("%d:%d" % (sid, svalue))
+        settings = ";".join(parts)
+        _validate_http2_settings(settings, param=param)
+        return settings
+    raise FingerprintError(
+        "%s 必须是 'id:value;...' 字符串或 {名称/id: 值} 字典，收到 %r" % (param, value))
+
+
+def _normalize_http2_window_updates(value: Any, param: str) -> int:
+    """连接级 WINDOW_UPDATE：收整数，或 ``{"0": 15663105}``。
+
+    只有流 0（连接级）可以改：libcurl 的 ``CURLOPT_HTTP2_WINDOW_UPDATE`` 就
+    只作用于连接窗口，浏览器指纹里那个数字也是连接级的。
+    """
+    if isinstance(value, Mapping):
+        if not value:
+            raise FingerprintError("%s 不能为空字典" % param)
+        others = [k for k in value if str(k).strip() != "0"]
+        if others:
+            raise FingerprintError(
+                "%s 只支持连接级窗口（流 0），收到流 %r"
+                % (param, sorted(str(k) for k in others)))
+        value = list(value.values())[0]
+    if value is None:
+        raise FingerprintError("%s 不能为空" % param)
+    return _int_field(value, param, 0, 0x7FFFFFFF)
+
+
+def _normalize_http2_pseudo_order(value: Any, param: str) -> str:
+    """伪头顺序：``"m,a,s,p"`` / ``"masp"`` / ``["m", "a", "s", "p"]`` -> ``"masp"``。"""
+    if isinstance(value, (list, tuple)):
+        letters = "".join(str(v) for v in value)
+    else:
+        letters = str(value)
+    order = letters.replace(",", "").replace(" ", "").lower()
+    if sorted(order) != ["a", "m", "p", "s"]:
+        raise FingerprintError(
+            "%s 必须是 m/a/s/p 四个字母的排列（如 'm,a,s,p' 或 'masp'），实际 %r"
+            % (param, value))
+    return order
+
+
+def _normalize_http2_priority(value: Any, param: str) -> str | None:
+    """PRIORITY 帧规格：``"1:0:0:201"``（可逗号分隔多条）；``0``/``None`` = 不发。"""
+    if value is None or value is False:
+        return None
+    if isinstance(value, bool):
+        raise FingerprintError(
+            "%s 收的是 PRIORITY 帧规格（如 '1:0:0:201'）或 0，收到 %r"
+            % (param, value))
+    if isinstance(value, int):
+        if value == 0:
+            return None
+        raise FingerprintError(
+            "%s 的整数写法只认 0（= 不发 PRIORITY 帧），收到 %r" % (param, value))
+    spec = str(value).strip()
+    if spec in ("", "0", "-"):
+        return None
+    for item in spec.split(","):
+        item = item.strip()
+        fields = item.split(":")
+        if len(fields) != 4 or not all(f.strip().lstrip("-").isdigit() for f in fields):
+            raise FingerprintError(
+                "%s 每段必须是 stream_id:exclusive:depends_on:weight，收到 %r"
+                % (param, item))
+        _int_field(fields[0], param + "/stream_id", 0, 0x7FFFFFFF)
+        _int_field(fields[1], param + "/exclusive", 0, 1)
+        _int_field(fields[2], param + "/depends_on", 0, 0x7FFFFFFF)
+        _int_field(fields[3], param + "/weight", 1, 256)
+    return spec
+
+
+def _parse_http2_frames(value: Any) -> "FingerprintOverrides":
+    """diy_fp["http2_frames"] -> 覆盖项（SETTINGS / WINDOW_UPDATE / PRIORITY / 伪头顺序）。
+
+    两种写法等价：
+
+    * 字符串：``SETTINGS|WINDOW_UPDATE|PRIORITY|ORDER``，
+      即 ``"1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p"``
+      （与 ``akamai=`` 参数完全同格式；第 3 段写 0 = 不发 PRIORITY 帧）；
+    * 字典：``{"settings": ..., "window_updates": ..., "order": ...,
+      "priority": ...}``，前三个必填，``priority`` 可选。``settings`` 收
+      ``"1:65536;2:0"`` 或 ``{"HEADER_TABLE_SIZE": 65536, ...}``；
+      ``window_updates`` 收 ``15663105`` 或 ``{"0": 15663105}``；
+      ``order`` 收 ``"m,a,s,p"`` / ``"masp"`` / ``["m","a","s","p"]``。
+    """
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.split("|")]
+        if len(parts) != 4:
+            raise FingerprintError(
+                "diy_fp['http2_frames'] 字符串必须是 4 段 "
+                "（SETTINGS|WINDOW_UPDATE|PRIORITY|ORDER），实际 %d 段: %r"
+                % (len(parts), value))
+        settings_raw, window_raw, priority_raw, order_raw = parts
+        return FingerprintOverrides(
+            http2_settings=_normalize_http2_settings(
+                settings_raw, "diy_fp['http2_frames']/settings"),
+            http2_window_update=_normalize_http2_window_updates(
+                window_raw, "diy_fp['http2_frames']/window_updates"),
+            http2_pseudo_headers_order=_normalize_http2_pseudo_order(
+                order_raw, "diy_fp['http2_frames']/order"),
+            http2_streams=_normalize_http2_priority(
+                priority_raw, "diy_fp['http2_frames']/priority"),
+        )
+
+    if not isinstance(value, Mapping):
+        raise FingerprintError(
+            "diy_fp['http2_frames'] 必须是字典或 'SETTINGS|WINDOW_UPDATE|PRIORITY|ORDER' "
+            "字符串，收到 %r" % (value,))
+
+    unknown = {str(k) for k in value} - _HTTP2_FRAMES_KEYS
+    if unknown:
+        raise FingerprintError(
+            "diy_fp['http2_frames'] 含未知键 %s；可用键: settings / window_updates / "
+            "order（可选 priority）" % sorted(unknown))
+
+    def pick(*names: str) -> Any:
+        for name in names:
+            if name in value:
+                return value[name]
+        return None
+
+    settings = pick("settings")
+    if settings is None:
+        raise FingerprintError("diy_fp['http2_frames'] 缺少 settings")
+    window = pick("window_updates", "window_update")
+    if window is None:
+        raise FingerprintError("diy_fp['http2_frames'] 缺少 window_updates")
+    order = pick("order", "pseudo_header_order", "pseudo_headers_order")
+    if order is None:
+        raise FingerprintError("diy_fp['http2_frames'] 缺少 order（伪头顺序）")
+
+    return FingerprintOverrides(
+        http2_settings=_normalize_http2_settings(
+            settings, "diy_fp['http2_frames']['settings']"),
+        http2_window_update=_normalize_http2_window_updates(
+            window, "diy_fp['http2_frames']['window_updates']"),
+        http2_pseudo_headers_order=_normalize_http2_pseudo_order(
+            order, "diy_fp['http2_frames']['order']"),
+        http2_streams=_normalize_http2_priority(
+            pick("priority"), "diy_fp['http2_frames']['priority']"),
+    )
+
+
 @dataclass
 class FingerprintOverrides:
     """可选的指纹覆盖项。``None`` 表示不覆盖（保留 impersonate 预设或库默认值）。
@@ -418,6 +621,8 @@ class FingerprintOverrides:
                 )
         if self.stream_weight is not None:
             _int_field(self.stream_weight, "http2_stream_weight", 0, 256)
+        if self.http2_streams is not None:
+            _normalize_http2_priority(self.http2_streams, "http2_streams")
         if self.stream_exclusive is not None:
             _int_field(self.stream_exclusive, "http2_stream_exclusive", 0, 1)
         if self.http2_headers_priority is not None and self.http2_no_priority:
@@ -715,6 +920,12 @@ def parse_diy_fp(diy_fp: Mapping[str, Any] | None) -> FingerprintOverrides:
             diy_fp["http2_stream_exclusive"], "http2_stream_exclusive", 0, 1)
     if diy_fp.get("http2_no_priority") is not None:
         ov.http2_no_priority = bool(diy_fp["http2_no_priority"])
+    if diy_fp.get("http2_headers_priority") is not None:
+        # 与 http2_no_priority=True 互斥，交给 validate() 统一报错
+        ov.http2_headers_priority = bool(diy_fp["http2_headers_priority"])
+    if diy_fp.get("http2_frames") is not None:
+        # 帧级整体自定义（SETTINGS / WINDOW_UPDATE / PRIORITY / 伪头顺序）
+        ov = ov.merge(_parse_http2_frames(diy_fp["http2_frames"]))
 
     if diy_fp.get("header_order") is not None:
         ov.header_order = _normalize_header_order(diy_fp["header_order"])

@@ -79,7 +79,7 @@ if [ "$KEEP_COMMENTS" = "0" ]; then
   rm -rf "$STAGE"
   mkdir -p "$STAGE"
   "$PY" "$RELEASE_TOOL" --tree "$PROJECT/nb_curl" "$STAGE/nb_curl"
-  cp -f setup.py pyproject.toml MANIFEST.in README.md "$STAGE/"
+  cp -f setup.py pyproject.toml MANIFEST.in README.md LICENSE "$STAGE/"
   [ -d tests ] && cp -rf tests "$STAGE/tests"
   BUILD_ROOT="$STAGE"
 else

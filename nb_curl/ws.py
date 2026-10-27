@@ -40,6 +40,7 @@ from .options import (
     CURLWS_PONG,
     CURLWS_TEXT,
     CURLE_AGAIN,
+    CURLE_GOT_NOTHING,
     CurlOpt,
 )
 

@@ -1,14 +1,20 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+# setuptools>=77 才有 PEP 639（license 写成 SPDX 串 + license-files），
+# 也只有它会在 dist-info/licenses/ 里带上 LICENSE —— 两个平台必须用**同一档**
+# 版本，否则同版本的两个 wheel 会产出不一样的 METADATA（老版本还不认 CRLF/LF 一致）。
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nb-curl"
-version = "0.3.1"
+version = "0.3.2"
 description = "自带浏览器 TLS/HTTP2 指纹的 HTTP 客户端（libcurl-impersonate + BoringSSL）"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+# 把仓库根的 LICENSE 打进 wheel 的 dist-info/licenses/，并生成 License-File 头。
+# 不新增任何文件：LICENSE 本来就在仓库里，之前只是没配进包元数据。
+license-files = ["LICENSE"]
 keywords = ["curl", "impersonate", "ja3", "ja4", "akamai", "tls-fingerprint", "http2"]
 classifiers = [
     "Programming Language :: Python :: 3",

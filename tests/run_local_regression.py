@@ -324,6 +324,37 @@ def case_proxy_empty_string(t: Tester, srv: LocalServer) -> None:
             os.environ[key] = saved
 
 
+@case("errors.one_line")
+def case_errors_one_line(t: Tester, srv: LocalServer) -> None:
+    """报错文案始终单行：细节照留，换行要被折叠掉（日志里别撑成一大坨）。
+
+    97 是最容易带附加信息的错误（代理子原因 + 本次走的哪个代理）；这里既直接
+    构造文案，也真发一次失败请求，两条路的 ``str(exc)`` 都不许出现 CR/LF ——
+    细节（子原因、走的代理、手册链接）一个都不能少。
+    """
+    m = t.mod
+    exc_mod = importlib.import_module(m.__name__ + ".exceptions")   # 不假设文件位置
+    text = exc_mod.curl_error_detail(
+        97, "proxy handshake error",
+        proxy_error=2, proxy_in_use="ALL_PROXY=socks5://127.0.0.1:1")
+    t.check("97 文案是单行", "\n" not in text and "\r" not in text, text[:200])
+    t.check("97 文案保留代理子原因",
+            "代理子原因 2 CURLPX_BAD_VERSION" in text, text[:200])
+    t.check("97 文案保留实际代理",
+            "ALL_PROXY=socks5://127.0.0.1:1" in text, text[:200])
+    t.check("97 文案保留错误码手册链接", exc_mod.CURL_ERROR_DOC in text, text[:200])
+
+    # 真发一次：回环上没人听的端口，立刻拒连；文案仍要单行、仍带错误码与手册
+    ok, exc = t.raises(
+        "连不上的端口会抛 RequestError", (m.RequestError,),
+        lambda: m.get("http://127.0.0.1:1/echo", timeout=10))
+    if ok and exc is not None:
+        msg = str(exc)
+        t.check("真实报错文案是单行", "\n" not in msg and "\r" not in msg, msg[:200])
+        t.check("真实报错文案带错误码与手册",
+                "(curl " in msg and exc_mod.CURL_ERROR_DOC in msg, msg[:200])
+
+
 # --------------------------------------------------------------------------- #
 # 2. 同步：方法与请求体
 # --------------------------------------------------------------------------- #
@@ -474,8 +505,12 @@ def case_headers_duplicate(t: Tester, srv: LocalServer) -> None:
     t.check("Headers 支持 get_list", hasattr(r.headers, "get_list"))
     vals = r.headers.get_list("x-dup") if hasattr(r.headers, "get_list") else []
     t.eq("两条重复头都保留且保序", vals, ["a", "b"])
-    t.check("get 返回其中一条而不是空", r.headers.get("x-dup") in ("a", "b"),
-            repr(r.headers.get("x-dup")))
+    # get / dict 视图把重复头按 ", " 合并（浏览器 Headers 与 RFC 7230 的语义），
+    # 只看单条用 get_list；以前这里返回其中一条，口径与浏览器不一致。
+    t.eq("get 把重复头按 ', ' 合并", r.headers.get("x-dup"), "a, b")
+    # 响应头的**名字大小写按服务端原样**，重复值按 ", " 合并；取值仍然大小写不敏感
+    t.eq("to_dict 保留原大小写且合并", r.headers.to_dict().get("X-Dup"), "a, b")
+    t.eq("keys() 保留原大小写", "X-Dup" in r.headers.keys(), True)
     t.check("头名大小写不敏感",
             r.headers.get("X-DUP") == r.headers.get("x-dup") == r.headers.get("X-Dup"),
             "%r %r" % (r.headers.get("X-DUP"), r.headers.get("x-dup")))
@@ -489,8 +524,10 @@ def case_headers_duplicate(t: Tester, srv: LocalServer) -> None:
     # 请求侧同名头（pairs 形式）：不允许崩，且不应出现多余的第 3 条
     d = m.get(srv.url("/echo"), headers=[("X-Multi", "a"), ("X-Multi", "b")], timeout=10).json()
     got = [v for k, v in d["header_list"] if k == "x-multi"]
-    t.check("请求侧同名头不会重复成多份", len(got) in (1, 2), "x-multi=%r" % (got,))
-    t.check("请求侧同名头的值合法", all(v in ("a", "b") for v in got), "x-multi=%r" % (got,))
+    # 浏览器（Chrome 155 实测：fetch 数组形式 / XHR 两次 setRequestHeader）把同名头
+    # 用 ", " 拼成一条；它根本发不出两行同名请求头。
+    t.check("请求侧同名头合并成一条", len(got) == 1, "x-multi=%r" % (got,))
+    t.eq("合并后的值是按序拼接", got, ["a, b"])
     t.note("请求侧同名头实测 %d 条：%r" % (len(got), got))
 
     # 重定向各跳的头各自成块，不互相污染
@@ -620,6 +657,96 @@ def case_cookies_request_scoped(t: Tester, srv: LocalServer) -> None:
     # 响应级 cookie 解析（不跟随重定向，直接看 302 的 Set-Cookie）
     r = m.get(srv.url("/cookies/set?r=9"), allow_redirects=False, timeout=10)
     t.eq("响应 cookies 解析 Set-Cookie", dict(r.cookies).get("r"), "9")
+
+
+@case("cookies.order")
+def case_cookies_order(t: Tester, srv: LocalServer) -> None:
+    """显式给 cookie 时：**顺序原样**、**值原样**、**位置原样**。
+
+    回归背景（两次）：
+    1. 早先把用户给的 cookie 塞进 libcurl 的 cookie 引擎由它拼头，而引擎会按
+       ``path 长度 > domain 长度 > name 长度 > 创建时间`` 排序
+       （``lib/cookie.c: cookie_sort``），于是
+
+           Cookie: uin=; p_uin=; p_uid=; SESSION_TRACE_ID=abc
+
+       到了线上变成
+
+           Cookie: SESSION_TRACE_ID=abc; p_uid=; p_uin=; uin=
+    2. 之后改走 ``CURLOPT_COOKIE``，顺序对了，但它和 ``cookies=`` 的串是"解析成
+       pairs 再拼回去"的：多余空格、重复名、末尾分号这些细节会被"整理"掉，
+       而且 CURLOPT_COOKIE 由 libcurl 在 header 块里**补**一条 ``Cookie:``
+       （写在自定义头之前），位置不受 ``headers=`` 控制 —— 用户在 headers 里
+       把 Cookie 放到最后，线上却在最前面。
+
+    现在：显式 cookie 就是一条真正的 header 行，值逐字节原样、位置就是给的位置。
+    """
+    m = t.mod
+    with m.Session() as s:
+        raw = s.get(srv.url("/echo"),
+                    headers={"Cookie": "uin=; p_uin=; p_uid=; SESSION_TRACE_ID=abc"},
+                    timeout=10).json()["headers"]["cookie"]
+        t.eq("显式 Cookie 头：顺序原样、空值也保留", _cookie_names(raw),
+             ["uin", "p_uin", "p_uid", "SESSION_TRACE_ID"])
+        t.check("显式 Cookie 头：值一字不差",
+                raw == "uin=; p_uin=; p_uid=; SESSION_TRACE_ID=abc", repr(raw))
+
+        # 逐字节透传：内部多余空格、重复名、大小写都不许被"整理"
+        # （行尾空白由服务端按 HTTP 语义剥掉，那是接收方行为，不是我们改写的）
+        odd = "uin=o1;p_uin=o2;   p_uid=u3; extra=; A=UPPER"
+        raw = s.get(srv.url("/echo"), headers={"Cookie": odd},
+                    timeout=10).json()["headers"]["cookie"]
+        t.check("显式 Cookie 头：内部空格/重复名/大小写都原样", raw == odd, repr(raw))
+
+        raw = s.get(srv.url("/echo"),
+                    cookies={"uin": "", "p_uin": "", "p_uid": "",
+                             "SESSION_TRACE_ID": "abc"},
+                    timeout=10).json()["headers"]["cookie"]
+        t.eq("请求级 cookies：按 dict 顺序", _cookie_names(raw),
+             ["uin", "p_uin", "p_uid", "SESSION_TRACE_ID"])
+
+        # 位置：Cookie 在 headers 里的位置就是它在线上的位置（不是永远排第一）
+        order = s.get(srv.url("/echo"),
+                      headers={"x-a": "1", "Cookie": "sid=1", "x-z": "2"},
+                      timeout=10).json()["header_list"]
+        names = [k for k, _ in order]
+        picked = [k for k in names if k in ("x-a", "cookie", "x-z")]
+        t.eq("Cookie 头位置跟着 headers= 走（夹在中间）", picked,
+             ["x-a", "cookie", "x-z"])
+        t.eq("线上只有一条 cookie 头", names.count("cookie"), 1)
+
+        order = s.get(srv.url("/echo"), headers={"x-a": "1", "x-z": "2"},
+                      cookies={"sid": "1"}, timeout=10).json()["header_list"]
+        names = [k for k, _ in order]
+        t.eq("只给 cookies= 时追加在末尾", [k for k in names if k in ("x-a", "x-z", "cookie")],
+             ["x-a", "x-z", "cookie"])
+
+        # 会话罐里有 cookie 时：显式给的在前（按给序），罐里的跟在后面
+        s.cookies["jarA"] = "1"
+        s.cookies["jarB"] = "2"
+        raw = s.get(srv.url("/echo"), headers={"Cookie": "z=9; a=1; m=5"},
+                    timeout=10).json()["headers"]["cookie"]
+        t.eq("显式在前、会话罐在后", _cookie_names(raw),
+             ["z", "a", "m", "jarA", "jarB"])
+        t.check("显式部分的值一字不差", raw.startswith("z=9; a=1; m=5"), repr(raw))
+        t.eq("显式 cookie 不会被同名会话 cookie 顶掉", _cookie_names(raw).count("m"), 1)
+
+        raw_after = s.get(srv.url("/echo"), timeout=10).json()["headers"]["cookie"]
+        t.check("显式 cookie 不写进会话罐（z 消失）", "z=9" not in raw_after, repr(raw_after))
+        t.check("后续请求会话罐照常下发", "jarA=1" in raw_after and "jarB=2" in raw_after,
+                repr(raw_after))
+        t.eq("只用会话罐时也只有一条 cookie 头",
+             [k for k, _ in s.get(srv.url("/echo"), timeout=10)
+              .json()["header_list"]].count("cookie"), 1)
+
+        # 显式 cookie 那次请求的 Set-Cookie 仍要学回会话罐（引擎照常记录）
+        s.cookies.clear()
+        s.get(srv.url("/cookies/set?learned=1"), timeout=10,
+              headers={"Cookie": "tmp=1"})
+        raw_after = s.get(srv.url("/echo"), timeout=10).json()["headers"]["cookie"]
+        t.check("显式 cookie 的请求也能学到 Set-Cookie",
+                "learned=1" in raw_after, repr(raw_after))
+        t.check("临时的显式 cookie 不会残留", "tmp=1" not in raw_after, repr(raw_after))
 
 
 @case("cookies.jar_absorb")

@@ -5,7 +5,7 @@
 
 | 文件 | 说明 |
 |---|---|
-| `run_local_regression.py` | 回归套件本体（29 个用例 + 结束时追加的 `server.cleanup` / 240 条断言，同步 + 异步） |
+| `run_local_regression.py` | 回归套件本体（29 个用例 + 结束时追加的 `server.cleanup` / 264 条断言，同步 + 异步） |
 | `test_protocols.py` | 协议层协商：本地 TLS 校验 / 错误 CA / 真实 HTTP/2 / WebSocket 收发 |
 | `test_http3.py` | HTTP/3 普通功能（本地 aioquic H3 UDP 服务端，强制 `3only` 不降级） |
 | `test_async_protocols.py` | `AsyncSession` 在同一个会话上的 multi 并发（H2 + H3）与流式行为 |
@@ -25,7 +25,7 @@
 在**仓库根目录**执行；被测实现由 `--package-path` 显式指定（`.` 即当前仓库）：
 
 ```bash
-# 回归套件本体（同步 + 异步，240 条断言）
+# 回归套件本体（同步 + 异步，264 条断言）
 python tests/run_local_regression.py --package-path .
 
 # 其余四个协议/元信息套件（都收 --backend）
@@ -122,7 +122,7 @@ python tests/test_socket_changes.py  --backend cffi
 
 | 套件 | 覆盖 | 关键口径 |
 |---|---|---|
-| `test_protocols.py` | 本地 CA 的 TLS 校验、无亲缘错误 CA 被拒、SAN 不匹配被拒、真实 H2 协商（ALPN 全 `h2`）、WebSocket 明文/TLS 收发（含分片与控制帧） | 证书现场生成，走客户端 `verify=True` + `ca_path=`；H3 只登记**未覆盖**，不假装测过 |
+| `test_protocols.py` | 本地 CA 的 TLS 校验、无亲缘错误 CA 被拒、SAN 不匹配被拒、真实 H2 协商（ALPN 全 `h2`）、H2 帧级自定义（SETTINGS 条目与顺序 / WINDOW_UPDATE / 伪头顺序，按服务端收到的原始字节断言）、WebSocket 明文/TLS 收发（含分片与控制帧） | 证书现场生成，走客户端 `verify=True` + `ca_path=`；H3 只登记**未覆盖**，不假装测过 |
 | `test_http3.py` | 本地 aioquic H3：单请求、连接复用、8 并发、错误 CA、HTTP3_ONLY 常量 | 断言 `resp.http_version == "3"` 且服务端 ALPN 全 `h3`，**不许静默降级**；响应体含 NUL 逐字节比对 |
 | `test_async_protocols.py` | 同一个 `AsyncSession(max_clients=8)` 上的 H2 / H3 multi 并发、顺序复用、流式、错误 CA | 并发连接数如实记录；顺序 2 请求只新增 1 条连接（复用硬断言） |
 | `test_stream_metadata.py` | 流式读完后 cookie 入罐与后续发送、头就绪 vs 完成后的元信息、HEAD/204/1xx、重定向后的 `url`/`history` | 只对照本仓库实现的实际行为，不从其它库搬语义 |
@@ -147,8 +147,8 @@ python tests/test_socket_changes.py  --backend cffi
 
 | 套件 | cffi | ctypes |
 |---|---|---|
-| `run_local_regression.py` | 240 条断言，通过 240 | 240 条断言，通过 240 |
-| `test_protocols.py` | 69 条断言，通过 69（另有 1 项 `[NOT-COVERED]`：H3 见 §5） | 69 条断言，通过 69 |
+| `run_local_regression.py` | 264 条断言，通过 264 | 264 条断言，通过 264 |
+| `test_protocols.py` | 94 条断言，通过 94（另有 1 项 `[NOT-COVERED]`：H3 见 §5） | 94 条断言，通过 94 |
 | `test_http3.py` | 29 条断言，通过 29，blocked 0 | 29 条断言，通过 29，blocked 0 |
 | `test_async_protocols.py` | 37 条断言，通过 37，blocked 0 | 37 条断言，通过 37，blocked 0 |
 | `test_stream_metadata.py` | 54 条，通过 54 | 54 条，通过 54 |

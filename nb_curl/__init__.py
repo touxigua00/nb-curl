@@ -50,6 +50,8 @@ from .session import (
     delete,
     get,
     head,
+    # 注意：这个名字会遮蔽同名的 options 子模块（requests 习惯优先）。
+    # 要拿 curl_options 的常量/白名单，走 from nb_curl.options import CurlOpt。
     options,
     patch,
     post,
@@ -63,7 +65,7 @@ from . import tcp as tcp
 from . import tls as tls
 from .tcp import set_tcp_warnings, tcp_support
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 
 def backend_name() -> str:

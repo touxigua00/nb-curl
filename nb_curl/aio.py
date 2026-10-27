@@ -41,7 +41,8 @@ from ._multi import AsyncDriver, async_result_to_response
 from .exceptions import NbCurlError
 from .models import Response
 from .params import REQUEST_KEYS, SessionOptions, Unpack, check_options
-from .session import Session, _merge_url
+from .session import (Session, TooManyRedirects, _final_url, _merge_url,
+                      next_redirect_hop, _STREAM_REACTOR_GRACE)
 
 __all__ = ["AsyncSession"]
 
@@ -166,7 +167,7 @@ class AsyncSession(AsyncSessionShortcuts, Session):
         if self._closing:
             raise NbCurlError("Session 已关闭")
 
-        prep = self._prepare(method, _merge_url(url, options.get("params")), options)
+        prep = self._prepare(method, _final_url(url, options.get("params")), options)
         tcp_profile = self._build_tcp(options, prep)
 
         driver, limit = self._async_context()
@@ -177,10 +178,33 @@ class AsyncSession(AsyncSessionShortcuts, Session):
             raise NbCurlError("Session 已关闭")
 
         try:
-            if prep.stream:
-                return await self._request_stream_async(prep, tcp_profile, limit)
-            return await self._request_nonstream_async(
-                prep, tcp_profile, driver, limit)
+            if not prep.follow_python:
+                if prep.stream:
+                    return await self._request_stream_async(prep, tcp_profile, limit)
+                return await self._request_nonstream_async(
+                    prep, tcp_profile, driver, limit)
+
+            # 非原生方法：Python 侧按浏览器矩阵逐跳跟（见 next_redirect_hop）
+            hops: list = []
+            while True:
+                response = await self._request_nonstream_async(
+                    prep, tcp_profile, driver, limit)
+                method, next_url, next_options = next_redirect_hop(prep, options, response)
+                if method is None:
+                    if hops:
+                        response.history = hops + list(response.history or [])
+                        response.redirect_count = len(response.history)
+                    return response
+                if len(hops) >= max(0, int(prep.max_redirects or 0)):
+                    raise TooManyRedirects(
+                        "重定向次数超限（max_redirects=%d）：%s"
+                        % (prep.max_redirects, next_url))
+                hops.append(response)
+                prep = self._prepare(method, next_url, next_options)
+                prep.redirects = False
+                prep.follow_python = True
+                prep.stream = False
+                tcp_profile = self._build_tcp(next_options, prep)
         finally:
             self._release_accepted(accepted)
 

@@ -104,19 +104,28 @@ def curl_proxy_hint(proxy_error: int) -> str:
     return _PROXY_PX_HINT.get(proxy_error_name(proxy_error), "")
 
 
+def _one_line(text: str) -> str:
+    """压成一行：换行 / 制表 / 连续空白统一折叠成一个空格。
+
+    报错文案是给日志看的：带换行时会撑成好几行，把上下文挤走（一行 ERROR
+    变成"一大坨"）。细节一个字不删，只是不再换行 —— 需要细看的人顺着看下去
+    即可，不需要的人也不受影响。
+    """
+    return " ".join(str(text).split())
+
+
 def curl_error_detail(code: int, message: str, *,
                       proxy_error: int | None = None,
                       proxy_in_use: str | None = None) -> str:
     """统一的报错文案：原始信息 + CURLcode 数值/符号名 + 中文说明 + 官方手册链接。
 
-    形如::
+    **整条文案保证是单行**（换行会被折叠成空格），形如::
 
-        SSL peer certificate ... (curl 60 CURLE_PEER_FAILED_VERIFICATION，
-        对端证书校验失败：...，错误码说明请参考：https://curl.se/libcurl/c/libcurl-errors.html)
+        SSL peer certificate ... (curl 60 CURLE_PEER_FAILED_VERIFICATION，对端证书校验失败：...，错误码说明请参考：https://curl.se/libcurl/c/libcurl-errors.html)
 
-    代理相关的错误再补两行，因为 97 的原文只说"代理握手失败"，既看不出是哪一步
-    坏（``proxy_error`` = ``CURLINFO_PROXY_ERROR``），也看不出走的是哪个代理
-    （``proxy_in_use``）—— 没配过代理却看到 97 时，这两行就是破案线索。
+    代理相关的错误再在同一行里补两段，因为 97 的原文只说"代理握手失败"，既看不出
+    是哪一步坏（``proxy_error`` = ``CURLINFO_PROXY_ERROR``），也看不出走的是哪个
+    代理（``proxy_in_use``）—— 没配过代理却看到 97 时，这两段就是破案线索。
     """
     from ._curle_generated import curl_error_name
 
@@ -129,18 +138,18 @@ def curl_error_detail(code: int, message: str, *,
     extra = []
     if proxy_error:
         name = proxy_error_name(proxy_error)
-        line = "代理子原因 %d %s" % (int(proxy_error), name)
+        part = "代理子原因 %d %s" % (int(proxy_error), name)
         px_hint = _PROXY_PX_HINT.get(name)
         if px_hint:
-            line += "，" + px_hint
-        extra.append(line)
+            part += "，" + px_hint
+        extra.append(part)
     if proxy_in_use:
         extra.append(
             '本次请求走了代理 %s；若不是本意，传 proxy="" 显式禁用，'
             "或清掉 http_proxy / https_proxy / all_proxy 环境变量后重试" % proxy_in_use)
     if extra:
-        detail += "\n  " + "\n  ".join(extra)
-    return detail
+        detail += "；" + "；".join(extra)
+    return _one_line(detail)
 
 
 class NbCurlError(Exception):

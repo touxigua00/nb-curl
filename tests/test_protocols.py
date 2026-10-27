@@ -524,6 +524,169 @@ def case_ws_tls(c: "Ctx") -> None:
                                                  ca_path=str(c.bundle.rogue_ca_path)))
 
 
+def _h2_cookie_fields(s, url, body_out: dict | None = None, **options):
+    """发一个 h2 请求，返回 (状态码, 服务端收到的 header 原样列表)。"""
+    r = s.get(url, timeout=25, **options)
+    body = r.json()
+    if body_out is not None:
+        body_out.update(body)
+    return r.status_code, [tuple(pair) for pair in body["header_fields"]]
+
+
+def case_h2_cookie_header(c: "Ctx") -> None:
+    """h2 上 Cookie 必须**一条** header 字段，且值/位置原样。
+
+    回归背景：curl-impersonate 的每个预设都开着 split_cookies，HTTP/2 下 libcurl
+    会把 ``Cookie: a=1; b=2`` 拆成两条 ``cookie`` 头（``lib/http.c`` 的
+    http_cookies split 分支）。按 RFC 9113 §8.2.3 接收方应该用 "; " 拼回去，但现实里
+    一堆服务端/中间件按"同名头覆盖"处理，于是整串登录态只剩最后一条。"给了一条、
+    线上变六条"也不是用户给什么就发什么。
+    """
+    ck = ("uin=o0123456789; p_uin=o0123456789; p_uid=u0123456789; "
+          "SESSION_TRACE_ID=1646sdsd1fgsd1fg5; a=5555; s=5555")
+    with c.suite.case("http2.cookie_header", "http2"):
+        srv = c.h2
+        with c.mod.Session(http_version="2", verify=True, ca_path=str(c.bundle.ca_path),
+                           timeout=25, connect_timeout=5) as s:
+            status, fields = _h2_cookie_fields(
+                s, srv.url("/ck/1"),
+                headers={"x-a": "1", "Cookie": ck, "x-z": "2"})
+            names = [k for k, _ in fields]
+            cookie_values = [v for k, v in fields if k == "cookie"]
+            c.suite.check("显式 Cookie 头在 h2 上只有一条", len(cookie_values) == 1,
+                          "cookie 字段=%r" % (cookie_values,))
+            c.suite.check("显式 Cookie 头的值逐字节原样",
+                          cookie_values == [ck], "%r" % (cookie_values,))
+            c.suite.check("Cookie 的位置跟着 headers= 走",
+                          [k for k in names if k in ("x-a", "cookie", "x-z")]
+                          == ["x-a", "cookie", "x-z"],
+                          "顺序=%r" % (names,))
+
+            status, fields = _h2_cookie_fields(
+                s, srv.url("/ck/2"), headers={"x-a": "1"}, cookies={
+                    "uin": "o0123456789", "a": "5555"})
+            cookie_values = [v for k, v in fields if k == "cookie"]
+            c.suite.check("请求级 cookies 在 h2 上也只有一条", len(cookie_values) == 1,
+                          "%r" % (cookie_values,))
+            c.suite.check("请求级 cookies 的值按 dict 顺序原样",
+                          cookie_values == ["uin=o0123456789; a=5555"],
+                          "%r" % (cookie_values,))
+
+            # 引擎那一路（会话罐自己没有显式 cookie 时）同样只发一条
+            s.cookies["jarA"] = "1"
+            s.cookies["jarB"] = "2"
+            status, fields = _h2_cookie_fields(s, srv.url("/ck/3"))
+            cookie_values = [v for k, v in fields if k == "cookie"]
+            c.suite.check("会话罐 cookie 在 h2 上只有一条", len(cookie_values) == 1,
+                          "%r" % (cookie_values,))
+            c.suite.check("会话罐 cookie 两条都在同一条头里",
+                          bool(cookie_values)
+                          and "jarA=1" in cookie_values[0]
+                          and "jarB=2" in cookie_values[0],
+                          "%r" % (cookie_values,))
+            s.cookies.clear()
+
+            # 显式开关只作用于**引擎那一路**（会话罐）：显式 Cookie 头永远是原样的
+            # 一条行，拆不拆不由 libcurl 的 cookie 代码决定，所以也不受影响。
+            s.cookies.clear()
+            s.cookies["a"] = "1"
+            s.cookies["b"] = "2"
+            status, fields = _h2_cookie_fields(s, srv.url("/ck/4"),
+                                               diy_fp={"split_cookies": True})
+            cookie_values = [v for k, v in fields if k == "cookie"]
+            # 实测 Chrome 155：h2 上 cookie 仍然只有**一条**头（本地 h2 服务端抓到
+            # `['a=1; b=2']`）。旧版 Chrome 拆行，现在不拆；diy_fp 这个开关对这条头
+            # 已经没有任何作用（保留字段只为 ABI 兼容）。
+            c.suite.check("split_cookies 开关不影响 Cookie 头（h2 也只发一条）",
+                          cookie_values == ["a=1; b=2"], "%r" % (cookie_values,))
+
+            status, fields = _h2_cookie_fields(s, srv.url("/ck/5"))
+            cookie_values = [v for k, v in fields if k == "cookie"]
+            c.suite.check("默认（不拆）时引擎 cookie 合成一条",
+                          len(cookie_values) == 1
+                          and "a=1" in cookie_values[0]
+                          and "b=2" in cookie_values[0], "%r" % (cookie_values,))
+            s.cookies.clear()
+
+
+def case_h2_frames(c: "Ctx") -> None:
+    """``diy_fp={"http2_frames": ...}``：SETTINGS / WINDOW_UPDATE / 伪头顺序真的落到帧上。
+
+    断言全部基于服务端收到的**原始字节**（``protocol_fixtures.H2Server`` 记录的
+    SETTINGS 条目（保序）、WINDOW_UPDATE 增量、伪头顺序），不看响应体猜。
+    这三样就是 Akamai HTTP/2 指纹的全部内容。
+    """
+    srv = c.h2
+    conn_opts = dict(verify=True, ca_path=str(c.bundle.ca_path),
+                     timeout=25, connect_timeout=5)
+
+    def run(**opts):
+        before = srv.connection_count()
+        with c.mod.Session(**conn_opts, **opts) as s:
+            r = s.get(srv.url("/frames"), timeout=25)
+            ok = r.status_code == 200 and r.http_version == "2"
+        for _ in range(80):                      # 等这条连接的帧落地
+            if srv.connection_count() > before and srv.last_settings():
+                break
+            time.sleep(0.05)
+        return ok, srv.last_settings(), srv.last_window_updates(), srv.last_pseudo_order
+
+    with c.suite.case("http2.frames_custom", "http2"):
+        # 1) 预设原样：Chrome 155 的 SETTINGS 内容与顺序
+        ok, settings, win, order = run(impersonate="chrome155")
+        c.suite.check("预设：请求成功且走 h2", ok)
+        c.suite.check("预设：SETTINGS 条目与顺序 = Chrome", settings == [
+            (1, 65536), (2, 0), (4, 6291456), (6, 262144)], "%r" % (settings,))
+        c.suite.check("预设：连接级 WINDOW_UPDATE = 15663105",
+                      win == [(0, 15663105)], "%r" % (win,))
+        c.suite.check("预设：伪头顺序 masp", order == "masp", repr(order))
+
+        # 2) 字典写法：名称 -> 值，顺序即发出顺序
+        ok, settings, win, order = run(impersonate="chrome155", diy_fp={"http2_frames": {
+            "settings": {"HEADER_TABLE_SIZE": 16384, "ENABLE_PUSH": 1,
+                         "INITIAL_WINDOW_SIZE": 2097152},
+            "window_updates": {"0": 10420225},
+            "order": "m,p,a,s",
+        }})
+        c.suite.check("字典：请求成功且走 h2", ok)
+        c.suite.check("字典：SETTINGS 按字典写入顺序发出",
+                      settings == [(1, 16384), (2, 1), (4, 2097152)], "%r" % (settings,))
+        c.suite.check("字典：window_updates={'0': ...} 生效",
+                      win == [(0, 10420225)], "%r" % (win,))
+        c.suite.check("字典：伪头顺序 m,p,a,s", order == "mpas", repr(order))
+
+        # 3) 字符串写法：SETTINGS|WINDOW_UPDATE|PRIORITY|ORDER
+        ok, settings, win, order = run(impersonate="chrome155", diy_fp={
+            "http2_frames":
+                "1:65536;2:0;3:1000;4:6291456;6:262144|12517377|0|m,a,s,p"})
+        c.suite.check("字符串：请求成功且走 h2", ok)
+        c.suite.check("字符串：SETTINGS 生效",
+                      settings == [(1, 65536), (2, 0), (3, 1000),
+                                   (4, 6291456), (6, 262144)], "%r" % (settings,))
+        c.suite.check("字符串：WINDOW_UPDATE 生效",
+                      win == [(0, 12517377)], "%r" % (win,))
+        c.suite.check("字符串：伪头顺序 masp", order == "masp", repr(order))
+
+        # 4) 非法写法要直接报错，不能静默忽略
+        for name, bad in (
+                ("段数不对", "1:65536|15663105|m,a,s,p"),
+                ("未知 settings 名", {"settings": {"NOPE": 1},
+                                      "window_updates": 1, "order": "masp"}),
+                ("非连接级 window_updates", {"settings": "1:65536",
+                                             "window_updates": {"3": 5},
+                                             "order": "masp"}),
+                ("缺 order", {"settings": "1:65536", "window_updates": 1}),
+        ):
+            try:
+                with c.mod.Session(**conn_opts, impersonate="chrome155",
+                                   diy_fp={"http2_frames": bad}) as s:
+                    s.get(srv.url("/frames"), timeout=25)
+                got = "no error"
+            except Exception as exc:  # noqa: BLE001
+                got = type(exc).__name__
+            c.suite.check("非法写法报错：%s" % name, got == "FingerprintError", got)
+
+
 CASES = [
     ("impl.select", None, case_impl),
     ("env.deps", None, case_deps),
@@ -532,6 +695,8 @@ CASES = [
     ("tls.hostname_mismatch_rejected", "cryptography", case_tls_hostname),
     ("http2.real_negotiation", "h2", case_h2_negotiation),
     ("http2.concurrent_streams", "h2", case_h2_concurrent),
+    ("http2.cookie_header", "h2", case_h2_cookie_header),
+    ("http2.frames_custom", "h2", case_h2_frames),
     ("ws.basic_frames", None, case_ws_basic),
     ("ws.server_initiated_close", None, case_ws_server_close),
     ("ws.tls_verify", "cryptography", case_ws_tls),

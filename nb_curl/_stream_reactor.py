@@ -80,7 +80,7 @@ class _Job:
     __slots__ = (
         "reader", "prep", "tcp_profile", "handle", "multi", "state",
         "paused", "pause_count", "resume_count", "cancel_requested",
-        "code", "error", "status", "finished", "transient",
+        "code", "error", "status", "finished",
     )
 
     def __init__(self, reader: "ReactorStream"):
@@ -98,8 +98,6 @@ class _Job:
         self.error: str | None = None
         self.status = 0
         self.finished = False
-        # 本次请求专用的 cookie（请求级 cookies / 显式 Cookie 头）：收尾时撤掉
-        self.transient: tuple = ()
 
 
 class ReactorStream:
@@ -274,10 +272,10 @@ class StreamReactor(PollCore):
             lib.easy_set_fresh_connect(handle, 1)   # 流用独立连接，不复用池
             session._apply_fingerprint(handle, job.prep.fingerprint)
             session._apply_handle_options(handle, job.prep)
-            # transient = 本次请求专用 cookie（请求级 cookies / 显式 Cookie 头）：
-            # 收尾时必须撤掉，且不进会话罐 —— 与同步路径同一套语义。
-            job.transient = session._sync_cookies(
-                handle, job.prep, hobj.pushed_cookies) or ()
+            # 显式 cookie（请求级 cookies / 显式 Cookie 头）在 _apply_handle_options
+            # 里走 CURLOPT_COOKIE 下发；这里同步会话罐时引擎会被清空静默 —— 与同步
+            # 路径同一套语义（见 Session._sync_cookies）。
+            session._sync_cookies(handle, job.prep, hobj.pushed_cookies)
             keepalive = lib.install_stream_callbacks(
                 handle, job.reader._on_chunk, job.reader._on_header)
             # **必须**在 multi_add 之前准备：方法名与请求体是在 native 的
@@ -483,7 +481,7 @@ class StreamReactor(PollCore):
         if handle is None or handle.ptr is None:
             return
         try:
-            info, cookie_dump = session._collect_result(handle, prep, job.transient)
+            info, cookie_dump = session._collect_result(handle, prep)
         except BaseException as exc:  # noqa: BLE001
             with reader._cond:
                 reader._exc = exc
@@ -496,8 +494,9 @@ class StreamReactor(PollCore):
         # 旧版流式同样是在收尾时刷的（test_stream_metadata 覆盖）。
         self._apply_stream_info(reader, info, cookie_dump)
         try:
-            session._finish(prep, info, cookie_dump, job.transient,
-                            raw_code, lib.strerror(raw_code) if raw_code else None)
+            session._finish(prep, info, cookie_dump,
+                            raw_code, lib.strerror(raw_code) if raw_code else None,
+                            getattr(reader, "response", None))
         except BaseException as exc:  # noqa: BLE001
             # 传输级错误（超时/连接失败…）原样抛给读者，与旧版一致
             with reader._cond:
